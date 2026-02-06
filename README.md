@@ -227,7 +227,7 @@ Spawns `cmd.exe`. Logged in Sysmon EID 1 / Windows EID 4688 with command line. N
 
 ## Noise Rating Explained
 
-The script uses **NOISE** rather than "OPSEC" ratings deliberately. "OPSEC: ★★★★" looks like a good thing — four stars of something you want. NOISE makes the scale intuitive: **more stars = worse**.
+The script rates commands by **NOISE** instead of "OPSEC" — because star ratings are instinctively read as "more = better." With NOISE, the meaning is immediately clear: **★ = quiet (good), ★★★★ = loud (bad)**.
 
 | Level | Label | What Lights Up |
 |-------|-------|----------------|
