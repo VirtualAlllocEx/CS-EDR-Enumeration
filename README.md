@@ -71,7 +71,7 @@ One compiled BOF, one `inline-execute` call. The operator picks scope at runtime
    edr_services_bof drv     ★     Drivers only (post-svc-kill check).
 3. edr_services_pick        ★★    If CLR loading is acceptable.
 4. edr_services_cmd         ★★★   If cmd.exe child is acceptable.
-5. edr_services              ★★★★  Only if PowerShell is already expected.
+5. edr_services             ★★★★  Only if PowerShell is already expected.
 6. edr_enum                 ★★★★  Full picture, highest artifact cost.
 ```
 
