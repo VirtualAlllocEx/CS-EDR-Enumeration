@@ -111,20 +111,20 @@ CS-EDR-Enumeration/
 
 Uses Beacon's native `bps()` — no child process, no DLL loads, no ETW. Zero artifacts.
 
-<img width="800" height="812" alt="image" src="https://github.com/user-attachments/assets/aa2f00ae-74aa-4db0-ae3a-f4762ab36e13" />
+<img width="700" height="812" alt="image" src="https://github.com/user-attachments/assets/aa2f00ae-74aa-4db0-ae3a-f4762ab36e13" />
 
 ### BOF Service Enumeration (`edr_services_bof`)
 
 In-process service enumeration via `OpenSCManagerW` + `EnumServicesStatusExW`. Same noise level as `edr_check`.
 
-<img width="1572" height="943" alt="image" src="https://github.com/user-attachments/assets/4b91bf47-04dc-44cd-8ac9-cc695c37500d" />
+<img width="700" height="943" alt="image" src="https://github.com/user-attachments/assets/4b91bf47-04dc-44cd-8ac9-cc695c37500d" />
 
 ### Other Methods
 
 <details>
 <summary>bpowerpick — Unmanaged PowerShell (★★)</summary>
 
-<img width="1611" height="939" alt="image" src="https://github.com/user-attachments/assets/7ebd8eec-c7b3-4da8-b9ca-8694e272d2f5" />
+<img width="700" height="939" alt="image" src="https://github.com/user-attachments/assets/7ebd8eec-c7b3-4da8-b9ca-8694e272d2f5" />
 
 Loads CLR into Beacon process. No `powershell.exe` child, but EDRs may flag unmanaged CLR hosting.
 </details>
@@ -132,7 +132,7 @@ Loads CLR into Beacon process. No `powershell.exe` child, but EDRs may flag unma
 <details>
 <summary>bpowershell — PowerShell Get-Service (★★★★)</summary>
 
-<img width="1621" height="926" alt="image" src="https://github.com/user-attachments/assets/d8075abc-67b3-4e2c-b28e-f28d0bbc699f" />
+<img width="700" height="926" alt="image" src="https://github.com/user-attachments/assets/d8075abc-67b3-4e2c-b28e-f28d0bbc699f" />
 
 Spawns `powershell.exe` — activates ScriptBlock logging, Module logging, AMSI, and process creation events.
 </details>
@@ -140,7 +140,7 @@ Spawns `powershell.exe` — activates ScriptBlock logging, Module logging, AMSI,
 <details>
 <summary>bshell — cmd.exe sc query (★★★)</summary>
 
-<img width="1551" height="981" alt="image" src="https://github.com/user-attachments/assets/5ded11af-71c8-4606-bb89-b3c0437ce0f8" />
+<img width="700" height="981" alt="image" src="https://github.com/user-attachments/assets/5ded11af-71c8-4606-bb89-b3c0437ce0f8" />
 
 Spawns `cmd.exe`. Logged in Sysmon EID 1 / Windows EID 4688 with command line. No CLR, no AMSI, no PS telemetry.
 </details>
