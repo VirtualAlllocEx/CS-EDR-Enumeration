@@ -98,7 +98,7 @@ Sysmon EID 7:       -      -     -     -     YES   -     -     -
 EID 4688:           -      -     -     -     -     YES   YES   YES
 ```
 
-> **-** = no artifact &nbsp;│&nbsp; **YES** = generated &nbsp;│&nbsp; **cmd/PS** = child process type &nbsp;│&nbsp; **poss** = if transcript logging is enabled. All **-** is ideal — more **YES** = more detection risk.
+> **-** = no artifact &nbsp;│&nbsp; **YES** = generated &nbsp;│&nbsp; **cmd/PS** = child process type &nbsp;│&nbsp; **poss** = only if transcript logging is enabled on the target. Fewer marks = lower detection risk.
 
 ### Coverage Matrix (What You Get Back)
 
