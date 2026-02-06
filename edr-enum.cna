@@ -1,0 +1,1761 @@
+# =============================================================================
+# edr_enum.cna - AV/EPP/EDR Enumeration via Beacon
+# Cobalt Strike 4.12 Aggressor Script
+#
+# Author:       Daniel
+# Version:      2.5.0
+# Last Updated: 2026-02-06
+#
+# Description:
+#   Enumerates endpoint security products (AV, EPP, EDR, Telemetry/SIEM)
+#   on a compromised host using multiple detection methods with varying
+#   noise footprints. The operator chooses the method that fits their
+#   current risk tolerance.
+#
+#   v2.5.0: Major signature database expansion across all three databases.
+#           Processes: 126 -> 198 (+72). Services: 73 -> 115 (+42).
+#           Drivers: 112 -> 132 (+20). Added 13 new vendors across all
+#           databases: Avast/AVG, Avira, Norton/Gen Digital, Check Point,
+#           Comodo/Xcitium, G Data, Emsisoft, Dr.Web, AhnLab, VIPRE,
+#           Cisco Secure Endpoint, Zscaler, with expanded coverage for
+#           existing vendors (SentinelOne, Microsoft, Trend Micro,
+#           Trellix/McAfee, ESET, Sophos, Kaspersky, Bitdefender,
+#           Fortinet, Cybereason). Total: 445 signatures across 48
+#           vendor groups.
+#           BOF mode argument: edr_services_bof now accepts [svc|drv|both]
+#           to control enumeration scope. One BOF, one inline-execute,
+#           operator picks scope at runtime. Backward compatible.
+#   v2.4.0: Expanded driver signature database from 66 to 112 entries.
+#           Added 17 new vendors: Avast/AVG, Malwarebytes, Avira, Webroot,
+#           Check Point, Comodo/Xcitium, G Data, CyberArk, Tanium, Nexthink,
+#           Emsisoft, Dr.Web, AhnLab, VIPRE, Endgame, Dell Secureworks,
+#           Cisco Secure Endpoint. Expanded existing vendors with missing
+#           drivers (SentinelOne +2, Trellix/McAfee +5, Sophos +1,
+#           Trend Micro +1, Fortinet +2, WithSecure +3, others).
+#   v2.3.0: Added kernel driver enumeration via BOF. The edr_services_bof
+#   command now enumerates both Win32 services (SERVICE_WIN32) and kernel
+#   drivers (SERVICE_DRIVER) in a single in-process call. Driver matches
+#   appear under a [DRV] tag and contribute to threat level assessment.
+#
+# =============================================================================
+#
+# COMMAND REFERENCE
+# =============================================================================
+#
+#   edr_check          Process-only check via bps()
+#   edr_enum           Full enumeration (bps + PowerShell WMI)
+#   edr_services       Service enum via PowerShell Get-Service
+#   edr_services_cmd   Service enum via cmd.exe + sc query
+#   edr_services_pick  Service enum via bpowerpick (unmanaged PS)
+#   edr_services_bof   Service + driver enum via inline BOF (requires compiled BOF)
+#                      Modes:  edr_services_bof       Both (default)
+#                              edr_services_bof svc   Services only
+#                              edr_services_bof drv   Drivers only
+#   edr_help           Detailed help with noise reference
+#
+# =============================================================================
+#
+# NOISE RATING METHODOLOGY
+# =============================================================================
+#
+# WHY "NOISE" AND NOT "OPSEC"
+#
+#   "OPSEC: ****" looks like a good thing -- four stars of something you want.
+#   But **** means HIGH detection risk. To avoid this confusion, ratings use
+#   "NOISE" -- a metric where MORE is clearly WORSE:
+#
+#     NOISE: *      = quiet, hard to detect     (GOOD)
+#     NOISE: ****   = loud, easy to detect      (BAD)
+#
+# WHAT THE STARS MEASURE
+#
+#   Detection surface: how many new telemetry sources light up when the
+#   command runs, on a host with a mature EDR and a staffed SOC. More
+#   stars = more noise = more places an analyst could spot the activity.
+#
+#   The commands themselves ("Get-Service", "sc query") are legitimate.
+#   The risk comes from HOW they execute: which process spawns, what
+#   DLLs load, which ETW providers fire, and whether logging frameworks
+#   (AMSI, ScriptBlock, Sysmon) capture the event.
+#
+# IMPORTANT: LEVELS ARE NOT CUMULATIVE
+#
+#   ** (CLR load) and *** (cmd.exe child) open DIFFERENT detection
+#   surfaces, not additive ones. cmd.exe does NOT load CLR. The star
+#   count reflects overall detection likelihood, not a strict superset
+#   of the previous level.
+#
+# DETECTION SURFACES BY LEVEL
+#
+# *     MINIMAL  -- Zero new detection surfaces.
+#       Runs inside the Beacon process. No child process, no DLL loads,
+#       no ETW providers, no logging frameworks triggered. The only way
+#       to observe this is user-mode API hooks already present in the
+#       Beacon process (and if those exist, the EDR sees everything
+#       already -- zero marginal risk).
+#       | Child proc | CLR | AMSI | ScriptBlock | Sysmon EID 1 | ETW |
+#       |     --     |  -- |  --  |      --     |      --      |  -- |
+#       Examples: bps(), inline BOF execution.
+#
+# **    LOW      -- +CLR runtime loaded into Beacon process.
+#       No child process, but clr.dll / clrjit.dll / mscoree.dll load
+#       into Beacon. ETW .NET Runtime provider fires. AMSI initializes
+#       and scans the script content. Key risk: EDRs flag "unmanaged
+#       CLR hosting" -- a non-.NET process suddenly loading the CLR is
+#       a well-known indicator of execute-assembly / powerpick tradecraft.
+#       | Child proc | CLR | AMSI | ScriptBlock | Sysmon EID 1 | ETW |
+#       |     --     | YES | YES  |      --     |      --      | .NET|
+#       Examples: bpowerpick().
+#
+# ***   MODERATE -- +Child process visible in process tree.
+#       Spawns cmd.exe. Process creation logged in Sysmon EID 1 and
+#       Windows EID 4688 with full command line. Parent-child lineage
+#       (spawnto -> cmd.exe) is the primary detection vector. However:
+#       no CLR, no AMSI, no PS logging. "sc query" is extremely common
+#       in admin scripts and monitoring tools -- low anomaly score.
+#       | Child proc | CLR | AMSI | ScriptBlock | Sysmon EID 1 | ETW |
+#       |   cmd.exe  |  -- |  --  |      --     |     YES      |  -- |
+#       Examples: bshell() with sc query.
+#
+# ****  HIGH     -- +PowerShell = maximum telemetry.
+#       Spawns powershell.exe, which activates every logging framework
+#       at once: Sysmon EID 1, ScriptBlock Log (EID 4104), Module Log
+#       (EID 4103), AMSI scan, CLR load, possible disk transcript.
+#       "Any process spawning powershell.exe" is a DEFAULT detection
+#       rule in CrowdStrike, SentinelOne, MDE, and most EDR products.
+#       | Child proc | CLR | AMSI | ScriptBlock | Sysmon EID 1 | ETW |
+#       |    PS.exe  | YES | YES  |     YES     |     YES      | ALL |
+#       Examples: bpowershell().
+#
+# ***** CRITICAL -- Disk writes, system modification, known-bad patterns.
+#       Near-certain detection. No edr_enum command reaches this level.
+#
+# KEY INSIGHT:
+#   The irony of using bpowershell() to enumerate EDR is that you spawn
+#   the most-monitored process on the system to ask whether the system
+#   is monitored. If CrowdStrike or MDE is present, the PowerShell spawn
+#   may alert BEFORE results come back telling you it's there.
+#
+# RECOMMENDED ESCALATION PATH:
+#   1. edr_check            *     Always safe first step
+#   2. edr_services_bof     *     If compiled BOF is available (svc/drv/both)
+#   3. edr_services_pick    **    If CLR loading is acceptable
+#   4. edr_services_cmd     ***   Good trade-off, avoids PS entirely
+#   5. edr_services         ****  Only if PS is already expected
+#   6. edr_enum             ****  Full picture, highest artifact cost
+#
+# MALLEABLE C2 DEPENDENCY:
+#   Commands spawning child processes (bshell, bpowershell, bpowerpick)
+#   use your Malleable C2 profile .post-ex.spawnto settings. The parent-
+#   child lineage is often MORE important than the command content.
+#
+# =============================================================================
+
+
+# -------------------------------------------------------------------------
+# Global state
+# -------------------------------------------------------------------------
+global('%edr_process_signatures %edr_service_signatures %edr_driver_signatures');
+global('%edr_pending_bids %edr_svc_pending %edr_cmd_pending %edr_pick_pending %edr_bof_pending');
+global('$edr_callback_lock');
+
+%edr_process_signatures = %();
+%edr_service_signatures = %();
+%edr_driver_signatures  = %();
+%edr_pending_bids       = %();
+%edr_svc_pending        = %();
+%edr_cmd_pending        = %();
+%edr_pick_pending       = %();
+%edr_bof_pending        = %();
+$edr_callback_lock      = 0;
+
+
+# =========================================================================
+# Signature database: process names
+# =========================================================================
+sub init_process_sigs {
+    # --- CrowdStrike Falcon ---
+    %edr_process_signatures["csfalconservice.exe"]      = "CrowdStrike | Falcon | EDR";
+    %edr_process_signatures["csfalconcontainer.exe"]     = "CrowdStrike | Falcon | EDR";
+    %edr_process_signatures["csagent.exe"]               = "CrowdStrike | Falcon Agent | EDR";
+    %edr_process_signatures["falconhost.exe"]            = "CrowdStrike | Falcon Host | EDR";
+
+    # --- SentinelOne ---
+    %edr_process_signatures["sentinelagent.exe"]         = "SentinelOne | Singularity Agent | EDR";
+    %edr_process_signatures["sentinelone.exe"]           = "SentinelOne | Singularity | EDR";
+    %edr_process_signatures["sentinelhelper.exe"]        = "SentinelOne | Helper | EDR";
+    %edr_process_signatures["sentinelservicehost.exe"]   = "SentinelOne | Service Host | EDR";
+    %edr_process_signatures["sentineluiagent.exe"]       = "SentinelOne | UI Agent | EDR";
+    %edr_process_signatures["sentinelstaticengine.exe"]  = "SentinelOne | Static Engine | EDR";
+    %edr_process_signatures["sentinelstaticenginescanner.exe"] = "SentinelOne | Static Engine Scanner | EDR";
+    %edr_process_signatures["sentinelmemoryscanner.exe"] = "SentinelOne | Memory Scanner | EDR";
+    %edr_process_signatures["logcollector.exe"]          = "SentinelOne | Log Collector | EDR";
+
+    # --- Carbon Black ---
+    %edr_process_signatures["cb.exe"]                    = "Carbon Black | App Control | EDR";
+    %edr_process_signatures["cbcomms.exe"]               = "Carbon Black | Communications | EDR";
+    %edr_process_signatures["cbstream.exe"]              = "Carbon Black | Stream | EDR";
+    %edr_process_signatures["cbdefense.exe"]             = "Carbon Black | Cloud Defense | EDR";
+    %edr_process_signatures["cbdefenseservice.exe"]      = "Carbon Black | Defense Service | EDR";
+    %edr_process_signatures["repux.exe"]                 = "Carbon Black | Response | EDR";
+    %edr_process_signatures["repwsc.exe"]                = "Carbon Black | Watchdog | EDR";
+    %edr_process_signatures["repserv.exe"]               = "Carbon Black | Server | EDR";
+
+    # --- Microsoft Defender / MDE ---
+    %edr_process_signatures["msmpeng.exe"]               = "Microsoft | Defender Antimalware | AV";
+    %edr_process_signatures["mpdefendercoreservice.exe"] = "Microsoft | Defender Core Service | AV";
+    %edr_process_signatures["msseces.exe"]               = "Microsoft | Security Essentials | AV";
+    %edr_process_signatures["securityhealthservice.exe"] = "Microsoft | Security Health | AV";
+    %edr_process_signatures["securityhealthsystray.exe"] = "Microsoft | Security Health Tray | AV";
+    %edr_process_signatures["sensecncproxy.exe"]         = "Microsoft | Defender for Endpoint | EDR";
+    %edr_process_signatures["mssense.exe"]               = "Microsoft | Defender for Endpoint | EDR";
+    %edr_process_signatures["sense.exe"]                 = "Microsoft | Defender for Endpoint Sense | EDR";
+    %edr_process_signatures["nissrv.exe"]                = "Microsoft | Defender NIS | AV";
+    %edr_process_signatures["sgrmbroker.exe"]            = "Microsoft | System Guard Runtime Broker | AV";
+    %edr_process_signatures["configsecuritypolicy.exe"]  = "Microsoft | Defender Config Policy | AV";
+
+    # --- Cortex XDR (Palo Alto) ---
+    %edr_process_signatures["cyserver.exe"]              = "Palo Alto | Cortex XDR Server | EDR";
+    %edr_process_signatures["cytray.exe"]                = "Palo Alto | Cortex XDR Tray | EDR";
+    %edr_process_signatures["cyveraservice.exe"]         = "Palo Alto | Cortex XDR Cyvera | EDR";
+    %edr_process_signatures["traborchestrator.exe"]      = "Palo Alto | Cortex XDR Traps | EDR";
+    %edr_process_signatures["trapsd.exe"]                = "Palo Alto | Cortex XDR Traps Daemon | EDR";
+    %edr_process_signatures["trapsagent.exe"]            = "Palo Alto | Traps Agent | EDR";
+    %edr_process_signatures["cyoptics.exe"]              = "Palo Alto | Cortex XDR Optics | EDR";
+
+    # --- Elastic Security ---
+    %edr_process_signatures["elastic-agent.exe"]         = "Elastic | Elastic Agent | EDR";
+    %edr_process_signatures["elastic-endpoint.exe"]      = "Elastic | Elastic Endpoint | EDR";
+    %edr_process_signatures["filebeat.exe"]              = "Elastic | Filebeat | Telemetry";
+    %edr_process_signatures["winlogbeat.exe"]            = "Elastic | Winlogbeat | Telemetry";
+    %edr_process_signatures["metricbeat.exe"]            = "Elastic | Metricbeat | Telemetry";
+
+    # --- Symantec / Broadcom ---
+    %edr_process_signatures["ccsvchst.exe"]              = "Broadcom | Symantec Endpoint Protection | EPP";
+    %edr_process_signatures["rtvscan.exe"]               = "Broadcom | Symantec Real-Time Scan | AV";
+    %edr_process_signatures["smcgui.exe"]                = "Broadcom | Symantec Management Client | EPP";
+    %edr_process_signatures["smc.exe"]                   = "Broadcom | Symantec Management Client | EPP";
+    %edr_process_signatures["snac.exe"]                  = "Broadcom | Symantec Network Access Control | EPP";
+    %edr_process_signatures["sepwscsvc64.exe"]           = "Broadcom | SEP WSC Service | EPP";
+    %edr_process_signatures["sepmasterservice.exe"]      = "Broadcom | SEP Master Service | EPP";
+
+    # --- Sophos ---
+    %edr_process_signatures["sophossps.exe"]             = "Sophos | Sophos Endpoint | EPP";
+    %edr_process_signatures["savservice.exe"]            = "Sophos | SAV Service | AV";
+    %edr_process_signatures["sophosui.exe"]              = "Sophos | Sophos UI | EPP";
+    %edr_process_signatures["sophoshealth.exe"]          = "Sophos | Health Service | EPP";
+    %edr_process_signatures["sophosfilescanner.exe"]     = "Sophos | File Scanner | AV";
+    %edr_process_signatures["sophosfs.exe"]              = "Sophos | File Scanner | AV";
+    %edr_process_signatures["sophosntp.exe"]             = "Sophos | Network Threat Protection | EPP";
+    %edr_process_signatures["hmpalert.exe"]              = "Sophos | Intercept X | EDR";
+    %edr_process_signatures["sspd.exe"]                  = "Sophos | Sophos Endpoint | EPP";
+    %edr_process_signatures["ssptray.exe"]               = "Sophos | Tray App | EPP";
+    %edr_process_signatures["sophosagent.exe"]           = "Sophos | Management Agent | EPP";
+    %edr_process_signatures["sophoscleanm.exe"]          = "Sophos | Clean Manager | EPP";
+    %edr_process_signatures["sophosinterceptx.exe"]      = "Sophos | Intercept X | EDR";
+
+    # --- Trend Micro ---
+    %edr_process_signatures["tmntsrv.exe"]               = "Trend Micro | Ntrtscan | AV";
+    %edr_process_signatures["tmccsf.exe"]                = "Trend Micro | Common Client Framework | EPP";
+    %edr_process_signatures["tmlisten.exe"]              = "Trend Micro | Listener | EPP";
+    %edr_process_signatures["tmbmsrv.exe"]               = "Trend Micro | Unauthorized Change Prevention | EPP";
+    %edr_process_signatures["ntrtscan.exe"]              = "Trend Micro | Real-time Scan | AV";
+    %edr_process_signatures["pccntmon.exe"]              = "Trend Micro | PC-cillin Monitor | AV";
+    %edr_process_signatures["coreserviceshell.exe"]      = "Trend Micro | Apex One | EDR";
+    %edr_process_signatures["ds_agent.exe"]              = "Trend Micro | Deep Security Agent | EDR";
+    %edr_process_signatures["endpointbasecamp.exe"]      = "Trend Micro | Vision One Basecamp | EDR";
+    %edr_process_signatures["tmproxy.exe"]               = "Trend Micro | Web Reputation Proxy | EPP";
+    %edr_process_signatures["wscservice.exe"]            = "Trend Micro | Web Security Client | EPP";
+    %edr_process_signatures["clientcommunicationservice.exe"] = "Trend Micro | Client Communication | EPP";
+    %edr_process_signatures["personalfirewallservice.exe"] = "Trend Micro | Personal Firewall | EPP";
+
+    # --- McAfee / Trellix ---
+    %edr_process_signatures["mfemactl.exe"]              = "Trellix | McAfee Agent Control | EPP";
+    %edr_process_signatures["mfetp.exe"]                 = "Trellix | McAfee Threat Prevention | EPP";
+    %edr_process_signatures["mfemms.exe"]                = "Trellix | McAfee Management Service | EPP";
+    %edr_process_signatures["masvc.exe"]                 = "Trellix | McAfee Agent Service | EPP";
+    %edr_process_signatures["macmnsvc.exe"]              = "Trellix | McAfee Agent | EPP";
+    %edr_process_signatures["mctray.exe"]                = "Trellix | McAfee Tray | EPP";
+    %edr_process_signatures["mcshield.exe"]              = "Trellix | McAfee On-Access Scanner | AV";
+    %edr_process_signatures["firesvc.exe"]               = "Trellix | FireEye HX Agent | EDR";
+    %edr_process_signatures["firetray.exe"]              = "Trellix | FireEye HX Tray | EDR";
+    %edr_process_signatures["xagt.exe"]                  = "Trellix | FireEye HX Agent | EDR";
+    %edr_process_signatures["mfeesp.exe"]                = "Trellix | McAfee Endpoint Security | EPP";
+    %edr_process_signatures["mfecanary.exe"]             = "Trellix | McAfee Canary Process | EPP";
+    %edr_process_signatures["mfeatp.exe"]                = "Trellix | McAfee ATP | EDR";
+
+    # --- ESET ---
+    %edr_process_signatures["ekrn.exe"]                  = "ESET | Kernel Service | AV";
+    %edr_process_signatures["egui.exe"]                  = "ESET | GUI | AV";
+    %edr_process_signatures["eamsi.exe"]                 = "ESET | AMSI Scanner | AV";
+    %edr_process_signatures["essvc.exe"]                 = "ESET | Security Service | AV";
+    %edr_process_signatures["eei_agent.exe"]             = "ESET | Inspect Agent | EDR";
+    %edr_process_signatures["ecls.exe"]                  = "ESET | Command Line Scanner | AV";
+    %edr_process_signatures["epfw.exe"]                  = "ESET | Personal Firewall | AV";
+
+    # --- Kaspersky ---
+    %edr_process_signatures["avp.exe"]                   = "Kaspersky | Endpoint Security | AV";
+    %edr_process_signatures["avpui.exe"]                 = "Kaspersky | Endpoint Security UI | AV";
+    %edr_process_signatures["kavfs.exe"]                 = "Kaspersky | File Server Security | AV";
+    %edr_process_signatures["klnagent.exe"]              = "Kaspersky | Network Agent | EPP";
+    %edr_process_signatures["avpexec.exe"]               = "Kaspersky | AV Process Launcher | AV";
+    %edr_process_signatures["klnsacwsvc.exe"]            = "Kaspersky | Network Security Agent | EPP";
+
+    # --- Bitdefender ---
+    %edr_process_signatures["bdagent.exe"]               = "Bitdefender | Agent | AV";
+    %edr_process_signatures["bdservicehost.exe"]         = "Bitdefender | Service Host | AV";
+    %edr_process_signatures["bdredline.exe"]             = "Bitdefender | Redline Agent | EDR";
+    %edr_process_signatures["epag.exe"]                  = "Bitdefender | GravityZone Agent | EDR";
+    %edr_process_signatures["epsecurityservice.exe"]     = "Bitdefender | Endpoint Security | EDR";
+    %edr_process_signatures["epintegrationservice.exe"]  = "Bitdefender | Integration Service | EDR";
+    %edr_process_signatures["epprotectedservice.exe"]    = "Bitdefender | Protected Service | EDR";
+
+    # --- Cylance (BlackBerry) ---
+    %edr_process_signatures["cylancesvc.exe"]            = "BlackBerry | Cylance PROTECT | EPP";
+    %edr_process_signatures["cylanceui.exe"]             = "BlackBerry | Cylance UI | EPP";
+    %edr_process_signatures["cylanceoptics.exe"]         = "BlackBerry | Cylance OPTICS | EDR";
+
+    # --- Fortinet FortiEDR ---
+    %edr_process_signatures["fortiedr.exe"]              = "Fortinet | FortiEDR Collector | EDR";
+    %edr_process_signatures["forticollector.exe"]        = "Fortinet | FortiEDR Collector | EDR";
+    %edr_process_signatures["fortiagent.exe"]            = "Fortinet | FortiClient Agent | EPP";
+    %edr_process_signatures["fortitray.exe"]             = "Fortinet | FortiClient Tray | EPP";
+    %edr_process_signatures["fortiavmon.exe"]            = "Fortinet | FortiClient AV Monitor | AV";
+    %edr_process_signatures["fortiwf.exe"]               = "Fortinet | FortiClient Web Filter | EPP";
+
+    # --- Cybereason ---
+    %edr_process_signatures["activeprobe.exe"]           = "Cybereason | Active Probe | EDR";
+    %edr_process_signatures["minionhost.exe"]            = "Cybereason | Minion Host | EDR";
+    %edr_process_signatures["executionpreventionsvc.exe"] = "Cybereason | Execution Prevention | EDR";
+    %edr_process_signatures["crssvc.exe"]                = "Cybereason | Sensor Service | EDR";
+    %edr_process_signatures["pyminionhost.exe"]          = "Cybereason | Python Minion Host | EDR";
+
+    # --- HarfangLab ---
+    %edr_process_signatures["hurukai.exe"]               = "HarfangLab | EDR Agent | EDR";
+
+    # --- WatchGuard / Panda ---
+    %edr_process_signatures["psanhost.exe"]              = "WatchGuard | Panda Endpoint | EPP";
+    %edr_process_signatures["psuaservice.exe"]           = "WatchGuard | Panda Endpoint Service | EPP";
+
+    # --- WithSecure / F-Secure ---
+    %edr_process_signatures["fsgk32.exe"]                = "WithSecure | F-Secure GateKeeper | AV";
+    %edr_process_signatures["fsav32.exe"]                = "WithSecure | F-Secure AV | AV";
+
+    # --- Webroot ---
+    %edr_process_signatures["wrsa.exe"]                  = "Webroot | SecureAnywhere | AV";
+
+    # --- Malwarebytes ---
+    %edr_process_signatures["mbamservice.exe"]           = "Malwarebytes | Anti-Malware Service | AV";
+    %edr_process_signatures["mbamtray.exe"]              = "Malwarebytes | System Tray | AV";
+    %edr_process_signatures["mbam.exe"]                  = "Malwarebytes | Anti-Malware | AV";
+    %edr_process_signatures["mbamagent.exe"]             = "Malwarebytes | Agent | AV";
+    %edr_process_signatures["epp.exe"]                   = "Malwarebytes | Endpoint Protection | EPP";
+
+    # --- Huntress ---
+    %edr_process_signatures["huntressagent.exe"]         = "Huntress | Agent | EDR";
+    %edr_process_signatures["huntressupdater.exe"]       = "Huntress | Updater | EDR";
+
+    # --- Qualys ---
+    %edr_process_signatures["qualysagent.exe"]           = "Qualys | Cloud Agent | Vuln Scanner";
+
+    # --- Tanium ---
+    %edr_process_signatures["taniumclient.exe"]          = "Tanium | Client | EPP";
+    %edr_process_signatures["taniumdetect.exe"]          = "Tanium | Detect | EDR";
+    %edr_process_signatures["taniumendpointindex.exe"]   = "Tanium | Endpoint Index | EDR";
+
+    # --- Rapid7 ---
+    %edr_process_signatures["ir_agent.exe"]              = "Rapid7 | Insight Agent | EDR";
+
+    # --- Deep Instinct ---
+    %edr_process_signatures["deepinstinctagent.exe"]     = "Deep Instinct | Agent | EDR";
+
+    # --- LimaCharlie ---
+    %edr_process_signatures["rphcp.exe"]                 = "LimaCharlie | Sensor | EDR";
+
+    # --- Sysmon ---
+    %edr_process_signatures["sysmon.exe"]                = "Microsoft | Sysmon | Telemetry";
+    %edr_process_signatures["sysmon64.exe"]              = "Microsoft | Sysmon 64-bit | Telemetry";
+
+    # --- Wazuh ---
+    %edr_process_signatures["wazuh-agent.exe"]           = "Wazuh | Agent | SIEM-EDR";
+    %edr_process_signatures["ossec-agent.exe"]           = "Wazuh | OSSEC Agent | SIEM-EDR";
+
+    # --- Splunk UF ---
+    %edr_process_signatures["splunkd.exe"]               = "Splunk | Universal Forwarder | Telemetry";
+
+    # --- Velociraptor ---
+    %edr_process_signatures["velociraptor.exe"]          = "Velociraptor | Agent | DFIR";
+
+    # --- Avast / AVG ---
+    %edr_process_signatures["avastui.exe"]               = "Avast | UI | AV";
+    %edr_process_signatures["avastsvc.exe"]              = "Avast | Service | AV";
+    %edr_process_signatures["avgsvc.exe"]                = "AVG | Service | AV";
+    %edr_process_signatures["avgui.exe"]                 = "AVG | UI | AV";
+    %edr_process_signatures["wsc_proxy.exe"]             = "Avast | WSC Proxy | AV";
+    %edr_process_signatures["overseer.exe"]              = "Avast | Overseer | AV";
+
+    # --- Avira ---
+    %edr_process_signatures["avgnt.exe"]                 = "Avira | Desktop Notification | AV";
+    %edr_process_signatures["avshadow.exe"]              = "Avira | Shadow Copy Service | AV";
+    %edr_process_signatures["avguard.exe"]               = "Avira | Real-Time Protection | AV";
+    %edr_process_signatures["avscan.exe"]                = "Avira | Scanner | AV";
+
+    # --- Norton / Gen Digital ---
+    %edr_process_signatures["ns.exe"]                    = "Norton | Security Service | AV";
+    %edr_process_signatures["nsservice.exe"]             = "Norton | Security Service | AV";
+    %edr_process_signatures["nswocsvc.exe"]              = "Norton | WSC Service | AV";
+    %edr_process_signatures["navapsvc.exe"]              = "Norton | AntiVirus Auto-Protect | AV";
+    %edr_process_signatures["nortonsecurity.exe"]        = "Norton | Security UI | AV";
+
+    # --- Check Point Harmony ---
+    %edr_process_signatures["cpda.exe"]                  = "Check Point | Daemon Agent | EPP";
+    %edr_process_signatures["epmonitor.exe"]             = "Check Point | Endpoint Monitor | EPP";
+    %edr_process_signatures["epmworker.exe"]             = "Check Point | Endpoint Worker | EPP";
+    %edr_process_signatures["tracsvrcalc.exe"]           = "Check Point | Tracker Service | EPP";
+    %edr_process_signatures["mediapatcher.exe"]          = "Check Point | Media Encryption | EPP";
+
+    # --- Comodo / Xcitium ---
+    %edr_process_signatures["cis.exe"]                   = "Comodo | Internet Security | EPP";
+    %edr_process_signatures["cmdagent.exe"]              = "Comodo | Agent | EPP";
+    %edr_process_signatures["cavse.exe"]                 = "Comodo | AV Scanner Engine | AV";
+    %edr_process_signatures["cesvc.exe"]                 = "Xcitium | Endpoint Service | EPP";
+
+    # --- G Data ---
+    %edr_process_signatures["gdsc.exe"]                  = "G Data | Security Client | AV";
+    %edr_process_signatures["gdfsvc.exe"]                = "G Data | File Server Security | AV";
+    %edr_process_signatures["gdscan.exe"]                = "G Data | AV Scanner | AV";
+
+    # --- Emsisoft ---
+    %edr_process_signatures["a2service.exe"]             = "Emsisoft | Anti-Malware Service | AV";
+    %edr_process_signatures["a2guard.exe"]               = "Emsisoft | Behavior Blocker | AV";
+    %edr_process_signatures["a2start.exe"]               = "Emsisoft | Anti-Malware UI | AV";
+
+    # --- Dr.Web ---
+    %edr_process_signatures["dwservice.exe"]             = "Dr.Web | Service | AV";
+    %edr_process_signatures["dwengine.exe"]              = "Dr.Web | Scanning Engine | AV";
+    %edr_process_signatures["spideragent.exe"]           = "Dr.Web | SpIDer Agent | AV";
+    %edr_process_signatures["dwscanner.exe"]             = "Dr.Web | Scanner | AV";
+    %edr_process_signatures["dwnetfilter.exe"]           = "Dr.Web | Network Filter | AV";
+
+    # --- AhnLab ---
+    %edr_process_signatures["v3svc.exe"]                 = "AhnLab | V3 Endpoint Service | AV";
+    %edr_process_signatures["v3sp.exe"]                  = "AhnLab | V3 Service Platform | AV";
+    %edr_process_signatures["asdsvc.exe"]                = "AhnLab | ASD Service | AV";
+    %edr_process_signatures["alunotify.exe"]             = "AhnLab | Update Notification | AV";
+
+    # --- VIPRE / ThreatTrack ---
+    %edr_process_signatures["sbamsvc.exe"]               = "VIPRE | Anti-Malware Service | AV";
+    %edr_process_signatures["sbamuisrv.exe"]             = "VIPRE | UI Service | AV";
+
+    # --- Cisco Secure Endpoint (AMP) ---
+    %edr_process_signatures["orbital.exe"]               = "Cisco | Orbital Agent | EDR";
+    %edr_process_signatures["iptray.exe"]                = "Cisco | Secure Endpoint Tray | EDR";
+    %edr_process_signatures["ampdaemon.exe"]             = "Cisco | AMP Daemon | EDR";
+
+    # --- Zscaler ---
+    %edr_process_signatures["zsatray.exe"]               = "Zscaler | Client Connector Tray | ZTNA";
+    %edr_process_signatures["zsaservice.exe"]            = "Zscaler | Client Connector Service | ZTNA";
+    %edr_process_signatures["zstunnel.exe"]              = "Zscaler | Tunnel Service | ZTNA";
+    %edr_process_signatures["zsatraymanager.exe"]        = "Zscaler | Tray Manager | ZTNA";
+}
+
+
+# =========================================================================
+# Signature database: service names
+# =========================================================================
+sub init_service_sigs {
+    %edr_service_signatures["csfalconservice"]      = "CrowdStrike | Falcon Sensor | EDR";
+    %edr_service_signatures["csagent"]              = "CrowdStrike | Falcon Agent | EDR";
+    %edr_service_signatures["csfalconcontainer"]    = "CrowdStrike | Falcon Container | EDR";
+    %edr_service_signatures["sentinelagent"]        = "SentinelOne | Singularity Agent | EDR";
+    %edr_service_signatures["sentinelstaticengine"] = "SentinelOne | Static Engine | EDR";
+    %edr_service_signatures["cbdefense"]            = "Carbon Black | Cloud Defense | EDR";
+    %edr_service_signatures["carbonblack"]          = "Carbon Black | EDR | EDR";
+    %edr_service_signatures["cbcomms"]              = "Carbon Black | Comms | EDR";
+    %edr_service_signatures["cbstream"]             = "Carbon Black | Streaming | EDR";
+    %edr_service_signatures["windefend"]            = "Microsoft | Windows Defender AV | AV";
+    %edr_service_signatures["mdcoresvc"]            = "Microsoft | Defender Core Service | AV";
+    %edr_service_signatures["mpssvc"]               = "Microsoft | Defender Firewall | AV";
+    %edr_service_signatures["wscsvc"]               = "Microsoft | Security Center | AV";
+    %edr_service_signatures["webthreatdefsvc"]      = "Microsoft | Web Threat Defense | AV";
+    %edr_service_signatures["webthreatdefusersvc"]  = "Microsoft | Web Threat Defense (User) | AV";
+    %edr_service_signatures["sense"]                = "Microsoft | Defender for Endpoint | EDR";
+    %edr_service_signatures["securityhealthservice"] = "Microsoft | Security Health | AV";
+    %edr_service_signatures["cyverasvc"]            = "Palo Alto | Cortex XDR Cyvera | EDR";
+    %edr_service_signatures["trapssvc"]             = "Palo Alto | Traps Service | EDR";
+    %edr_service_signatures["cyserver"]             = "Palo Alto | Cortex XDR Server | EDR";
+    %edr_service_signatures["elastic-agent"]        = "Elastic | Elastic Agent | EDR";
+    %edr_service_signatures["elastic-endpoint"]     = "Elastic | Elastic Endpoint | EDR";
+    %edr_service_signatures["filebeat"]             = "Elastic | Filebeat | Telemetry";
+    %edr_service_signatures["winlogbeat"]           = "Elastic | Winlogbeat | Telemetry";
+    %edr_service_signatures["sepwscsvc"]            = "Broadcom | SEP WSC Service | EPP";
+    %edr_service_signatures["sepmasterservice"]     = "Broadcom | SEP Master Service | EPP";
+    %edr_service_signatures["ccsvchst"]             = "Broadcom | Symantec Endpoint Protection | EPP";
+    %edr_service_signatures["sophossps"]            = "Sophos | Endpoint | EPP";
+    %edr_service_signatures["hmpalert"]             = "Sophos | Intercept X | EDR";
+    %edr_service_signatures["savservice"]           = "Sophos | SAV Service | AV";
+    %edr_service_signatures["sophoshealth"]         = "Sophos | Health Service | EPP";
+    %edr_service_signatures["sophosntpservice"]     = "Sophos | Network Threat Protection | EPP";
+    %edr_service_signatures["sophosfilescanner"]    = "Sophos | File Scanner | AV";
+    %edr_service_signatures["sophosagent"]          = "Sophos | Management Agent | EPP";
+    %edr_service_signatures["tmntsrv"]              = "Trend Micro | OfficeScan NT | AV";
+    %edr_service_signatures["tmlisten"]             = "Trend Micro | Listener | EPP";
+    %edr_service_signatures["ds_agent"]             = "Trend Micro | Deep Security | EDR";
+    %edr_service_signatures["tmbmsrv"]              = "Trend Micro | Unauthorized Change Prevention | EPP";
+    %edr_service_signatures["coreserviceshell"]     = "Trend Micro | Apex One | EDR";
+    %edr_service_signatures["mfefire"]              = "Trellix | McAfee Firewall | EPP";
+    %edr_service_signatures["mfemms"]               = "Trellix | McAfee Management | EPP";
+    %edr_service_signatures["masvc"]                = "Trellix | McAfee Agent | EPP";
+    %edr_service_signatures["macmnsvc"]             = "Trellix | McAfee Agent | EPP";
+    %edr_service_signatures["xagt"]                 = "Trellix | FireEye HX | EDR";
+    %edr_service_signatures["firesvc"]              = "Trellix | FireEye HX Agent | EDR";
+    %edr_service_signatures["mfetp"]                = "Trellix | McAfee Threat Prevention | EPP";
+    %edr_service_signatures["mfeesp"]               = "Trellix | McAfee Endpoint Security | EPP";
+    %edr_service_signatures["ekrn"]                 = "ESET | Kernel Service | AV";
+    %edr_service_signatures["eei_agent"]            = "ESET | Inspect Agent | EDR";
+    %edr_service_signatures["essvc"]                = "ESET | Security Service | AV";
+    %edr_service_signatures["avp"]                  = "Kaspersky | Endpoint Security | AV";
+    %edr_service_signatures["klnagent"]             = "Kaspersky | Network Agent | EPP";
+    %edr_service_signatures["epag"]                 = "Bitdefender | GravityZone | EDR";
+    %edr_service_signatures["epsecurityservice"]    = "Bitdefender | Endpoint Security | EDR";
+    %edr_service_signatures["epintegrationservice"] = "Bitdefender | Integration Service | EDR";
+    %edr_service_signatures["epprotectedservice"]   = "Bitdefender | Protected Service | EDR";
+    %edr_service_signatures["bdredline"]            = "Bitdefender | Redline Agent | EDR";
+    %edr_service_signatures["cylancesvc"]           = "BlackBerry | Cylance PROTECT | EPP";
+    %edr_service_signatures["fortiedr"]             = "Fortinet | FortiEDR | EDR";
+    %edr_service_signatures["forticollector"]       = "Fortinet | FortiEDR Collector | EDR";
+    %edr_service_signatures["forticlientmon"]       = "Fortinet | FortiClient Monitor | EPP";
+    %edr_service_signatures["crssvc"]               = "Cybereason | Sensor | EDR";
+    %edr_service_signatures["activeprobe"]          = "Cybereason | Active Probe | EDR";
+    %edr_service_signatures["hurukai"]              = "HarfangLab | EDR Agent | EDR";
+    %edr_service_signatures["psanhost"]             = "WatchGuard | Panda Endpoint | EPP";
+    %edr_service_signatures["psuaservice"]          = "WatchGuard | Panda Endpoint Service | EPP";
+    %edr_service_signatures["fsgk32"]               = "WithSecure | F-Secure GateKeeper | AV";
+    %edr_service_signatures["fsav32"]               = "WithSecure | F-Secure AV | AV";
+    %edr_service_signatures["wrsa"]                 = "Webroot | SecureAnywhere | AV";
+    %edr_service_signatures["taniumclient"]         = "Tanium | Client | EPP";
+    %edr_service_signatures["taniumdetect"]         = "Tanium | Detect | EDR";
+    %edr_service_signatures["ir_agent"]             = "Rapid7 | Insight Agent | EDR";
+    %edr_service_signatures["sysmon"]               = "Microsoft | Sysmon | Telemetry";
+    %edr_service_signatures["sysmon64"]             = "Microsoft | Sysmon 64 | Telemetry";
+    %edr_service_signatures["wazuhsvc"]             = "Wazuh | Agent | SIEM-EDR";
+    %edr_service_signatures["ossecagent"]           = "Wazuh | OSSEC Agent | SIEM-EDR";
+    %edr_service_signatures["splunkforwarder"]      = "Splunk | Forwarder | Telemetry";
+    %edr_service_signatures["huntressagent"]        = "Huntress | Agent | EDR";
+    %edr_service_signatures["qualysagent"]          = "Qualys | Cloud Agent | Vuln Scanner";
+    %edr_service_signatures["deepinstinctsvc"]      = "Deep Instinct | Agent | EDR";
+    %edr_service_signatures["mbamservice"]          = "Malwarebytes | Service | AV";
+    %edr_service_signatures["rphcpsvc"]             = "LimaCharlie | Sensor | EDR";
+    %edr_service_signatures["velociraptor"]         = "Velociraptor | Agent | DFIR";
+
+    # --- Avast / AVG ---
+    %edr_service_signatures["avastsvc"]             = "Avast | AV Service | AV";
+    %edr_service_signatures["avast"]                = "Avast | Antivirus | AV";
+    %edr_service_signatures["avgsvc"]               = "AVG | AV Service | AV";
+    %edr_service_signatures["avgantivirus"]         = "AVG | Antivirus Service | AV";
+
+    # --- Avira ---
+    %edr_service_signatures["antivirservice"]       = "Avira | AntiVir Service | AV";
+    %edr_service_signatures["antivirscheduler"]     = "Avira | Scheduler Service | AV";
+    %edr_service_signatures["avguard"]              = "Avira | Real-Time Protection | AV";
+
+    # --- Norton / Gen Digital ---
+    %edr_service_signatures["norton"]               = "Norton | Security Service | AV";
+    %edr_service_signatures["nsservice"]            = "Norton | Security Service | AV";
+    %edr_service_signatures["navapsvc"]             = "Norton | Auto-Protect | AV";
+    %edr_service_signatures["nswocsvc"]             = "Norton | WSC Service | AV";
+
+    # --- Check Point Harmony ---
+    %edr_service_signatures["epsecurity"]           = "Check Point | Endpoint Security | EPP";
+    %edr_service_signatures["tracsvrcalc"]          = "Check Point | Tracker Service | EPP";
+    %edr_service_signatures["mediapatcher"]         = "Check Point | Media Encryption | EPP";
+
+    # --- Comodo / Xcitium ---
+    %edr_service_signatures["cmdagent"]             = "Comodo | Agent Service | EPP";
+    # NOTE: "cesvc" removed - false positive on Windows PimIndexMaintenanceSvc
+    # Comodo/Xcitium still detected via cmdagent (svc), cmdguard/cmdhlp (drv),
+    # cis.exe/cmdagent.exe/cavse.exe (proc).
+
+    # --- G Data ---
+    %edr_service_signatures["gdsc"]                 = "G Data | Security Client | AV";
+    %edr_service_signatures["gdfsvc"]               = "G Data | File Server Security | AV";
+    %edr_service_signatures["gdscan"]               = "G Data | Scanner | AV";
+
+    # --- Emsisoft ---
+    %edr_service_signatures["a2service"]            = "Emsisoft | Anti-Malware Service | AV";
+    %edr_service_signatures["a2guard"]              = "Emsisoft | Behavior Blocker | AV";
+
+    # --- Dr.Web ---
+    %edr_service_signatures["drwebservice"]         = "Dr.Web | Service | AV";
+    %edr_service_signatures["dwengine"]             = "Dr.Web | Scanning Engine | AV";
+    %edr_service_signatures["spideragent"]          = "Dr.Web | SpIDer Agent | AV";
+
+    # --- AhnLab ---
+    %edr_service_signatures["v3svc"]                = "AhnLab | V3 Endpoint | AV";
+    %edr_service_signatures["asdsvc"]               = "AhnLab | ASD Service | AV";
+
+    # --- VIPRE / ThreatTrack ---
+    %edr_service_signatures["sbamsvc"]              = "VIPRE | Anti-Malware Service | AV";
+
+    # --- Cisco Secure Endpoint (AMP) ---
+    %edr_service_signatures["ciscoampsvc"]          = "Cisco | Secure Endpoint Service | EDR";
+    %edr_service_signatures["orbital"]              = "Cisco | Orbital Agent | EDR";
+    %edr_service_signatures["immunetprotect"]       = "Cisco | Immunet Protect | EDR";
+
+    # --- Zscaler ---
+    %edr_service_signatures["zscalerservice"]       = "Zscaler | Client Connector | ZTNA";
+    %edr_service_signatures["ztunnel"]              = "Zscaler | Tunnel Service | ZTNA";
+}
+
+
+# =========================================================================
+# Signature database: kernel driver service names (SCM type 1/2/8)
+#
+# These are the SCM-registered names for kernel drivers. The BOF
+# enumerates them via EnumServicesStatusExW with SERVICE_DRIVER and
+# outputs "DRIVER_NAME: xxx" lines. Matching uses the same isin
+# substring logic as service signatures.
+#
+# WHY THIS MATTERS:
+#   1. Kernel-only components may not have a matching user-mode service
+#      name in the service signature DB.
+#   2. A user-mode service can be stopped while the kernel driver stays
+#      loaded and enforcing callbacks/minifilter rules.
+#   3. Driver names reveal minifilter, callback, and ETW kernel
+#      instrumentation that the process/service view cannot show.
+# =========================================================================
+sub init_driver_sigs {
+    # --- CrowdStrike ---
+    %edr_driver_signatures["csagent"]              = "CrowdStrike | Falcon Kernel Driver | EDR";
+    %edr_driver_signatures["csboot"]               = "CrowdStrike | Falcon Boot Driver | EDR";
+    %edr_driver_signatures["csdevicecontrol"]      = "CrowdStrike | Device Control Driver | EDR";
+
+    # --- SentinelOne ---
+    %edr_driver_signatures["sentinelmonitor"]      = "SentinelOne | Kernel Monitor | EDR";
+    %edr_driver_signatures["sentinelelam"]         = "SentinelOne | ELAM Driver | EDR";
+    %edr_driver_signatures["sentineldevicecontrol"] = "SentinelOne | Device Control Driver | EDR";
+    %edr_driver_signatures["sentinelnetworkmonitor"] = "SentinelOne | Network Monitor Driver | EDR";
+
+    # --- Microsoft Defender ---
+    %edr_driver_signatures["wdfilter"]             = "Microsoft | Defender Minifilter | AV";
+    %edr_driver_signatures["wdnisdrv"]             = "Microsoft | Defender NIS Driver | AV";
+    %edr_driver_signatures["wdboot"]               = "Microsoft | Defender Boot Driver | AV";
+    %edr_driver_signatures["mssecflt"]             = "Microsoft | Defender for Endpoint Minifilter | EDR";
+
+    # --- Sysmon ---
+    %edr_driver_signatures["sysmondrv"]            = "Microsoft | Sysmon Driver | Telemetry";
+
+    # --- Carbon Black ---
+    %edr_driver_signatures["carbonblackk"]         = "Carbon Black | Kernel Driver | EDR";
+    %edr_driver_signatures["cbk7"]                 = "Carbon Black | Kernel Module | EDR";
+    %edr_driver_signatures["ctifile"]              = "Carbon Black | File Filter | EDR";
+    %edr_driver_signatures["cticomms"]             = "Carbon Black | Comms Driver | EDR";
+
+    # --- Cortex XDR (Palo Alto) ---
+    %edr_driver_signatures["cyverak"]              = "Palo Alto | Cortex XDR Kernel Driver | EDR";
+    %edr_driver_signatures["tladriver"]            = "Palo Alto | Cortex XDR TLA Driver | EDR";
+    %edr_driver_signatures["cyvrfsfd"]             = "Palo Alto | Cortex XDR FS Filter | EDR";
+
+    # --- Elastic ---
+    %edr_driver_signatures["elasticendpoint"]      = "Elastic | Endpoint Driver | EDR";
+
+    # --- Sophos ---
+    %edr_driver_signatures["sophosed"]             = "Sophos | Endpoint Defense Driver | EPP";
+    %edr_driver_signatures["savonaccess"]          = "Sophos | On-Access Filter | AV";
+    %edr_driver_signatures["sdcfilter"]            = "Sophos | Data Control Filter | EPP";
+    %edr_driver_signatures["hmpalert"]             = "Sophos | HitmanPro.Alert Driver | EDR";
+    %edr_driver_signatures["sophosntpflt"]         = "Sophos | NTP Minifilter | EPP";
+    %edr_driver_signatures["safestorefilter"]      = "Sophos | SafeStore Filter | EPP";
+
+    # --- Trend Micro ---
+    %edr_driver_signatures["tmcomm"]               = "Trend Micro | Common Module Driver | EPP";
+    %edr_driver_signatures["tmactmon"]             = "Trend Micro | Activity Monitor Driver | EDR";
+    %edr_driver_signatures["tmevtmgr"]             = "Trend Micro | Event Manager Driver | EDR";
+    %edr_driver_signatures["tmebc"]                = "Trend Micro | Exploit Block Driver | EDR";
+    %edr_driver_signatures["tmumh"]                = "Trend Micro | UMH Driver | EPP";
+    %edr_driver_signatures["tmtdi"]                = "Trend Micro | TDI Driver | EPP";
+    %edr_driver_signatures["tmxpflt"]              = "Trend Micro | Cross-Platform Minifilter | EDR";
+
+    # --- Trellix / McAfee / FireEye ---
+    %edr_driver_signatures["mfehidk"]              = "Trellix | McAfee HIPS IDS Kernel | EPP";
+    %edr_driver_signatures["mfefirek"]             = "Trellix | McAfee Firewall Kernel | EPP";
+    %edr_driver_signatures["mfencbdc"]             = "Trellix | McAfee Network Control | EPP";
+    %edr_driver_signatures["mfeavfk"]              = "Trellix | McAfee AV Filter Kernel | AV";
+    %edr_driver_signatures["mfewfpk"]              = "Trellix | McAfee WFP Kernel | EPP";
+    %edr_driver_signatures["mfeaskm"]              = "Trellix | McAfee Anti-Stealth Kernel | EPP";
+    %edr_driver_signatures["mfencfilter"]          = "Trellix | McAfee Network Content Filter | EPP";
+    %edr_driver_signatures["hxdriver"]             = "Trellix | FireEye HX Kernel Driver | EDR";
+    %edr_driver_signatures["fekern"]               = "Trellix | FireEye Kernel Driver | EDR";
+    %edr_driver_signatures["wfp_mrt"]              = "Trellix | FireEye WFP MRT Driver | EDR";
+
+    # --- ESET ---
+    %edr_driver_signatures["eamonm"]               = "ESET | File System Monitor | AV";
+    %edr_driver_signatures["ehdrv"]                = "ESET | Helper Driver | AV";
+    %edr_driver_signatures["ekbdflt"]              = "ESET | Keyboard Filter | AV";
+    %edr_driver_signatures["epfwwfp"]              = "ESET | Firewall WFP Driver | AV";
+    %edr_driver_signatures["epfw"]                 = "ESET | Firewall Driver | AV";
+    %edr_driver_signatures["eelam"]                = "ESET | ELAM Driver | AV";
+    %edr_driver_signatures["edevmon"]              = "ESET | Device Monitor | AV";
+
+    # --- Kaspersky ---
+    %edr_driver_signatures["klif"]                 = "Kaspersky | Interceptor Filter | AV";
+    %edr_driver_signatures["klhk"]                 = "Kaspersky | Hook Driver | AV";
+    %edr_driver_signatures["kltdi"]                = "Kaspersky | TDI Driver | AV";
+    %edr_driver_signatures["klwfp"]                = "Kaspersky | WFP Callout Driver | AV";
+    %edr_driver_signatures["kneps"]                = "Kaspersky | Network Protection | AV";
+    %edr_driver_signatures["klelam"]               = "Kaspersky | ELAM Driver | AV";
+    %edr_driver_signatures["klbackupdisk"]         = "Kaspersky | Backup Disk Filter | AV";
+    %edr_driver_signatures["klam"]                 = "Kaspersky | Anti-Malware Filter | AV";
+    %edr_driver_signatures["klboot"]               = "Kaspersky | Boot Driver | AV";
+    %edr_driver_signatures["kldisk"]               = "Kaspersky | Disk Filter | AV";
+
+    # --- Bitdefender ---
+    %edr_driver_signatures["bdselfpr"]             = "Bitdefender | Self-Protection Driver | EDR";
+    %edr_driver_signatures["trufos"]               = "Bitdefender | Scanning Driver | AV";
+    %edr_driver_signatures["bdfndisf"]             = "Bitdefender | Network Filter | AV";
+    %edr_driver_signatures["gzflt"]                = "Bitdefender | GravityZone Minifilter | EDR";
+    %edr_driver_signatures["bdelam"]               = "Bitdefender | ELAM Driver | AV";
+    %edr_driver_signatures["avckf"]                = "Bitdefender | AV Callback Filter | AV";
+    %edr_driver_signatures["bddevflt"]             = "Bitdefender | Device Filter | AV";
+    %edr_driver_signatures["bdfwfpf"]              = "Bitdefender | WFP Firewall Filter | AV";
+
+    # --- Cylance (BlackBerry) ---
+    %edr_driver_signatures["cylancedrv"]           = "BlackBerry | Cylance Kernel Driver | EPP";
+
+    # --- Fortinet ---
+    %edr_driver_signatures["fortishield"]          = "Fortinet | FortiEDR Shield Driver | EDR";
+    %edr_driver_signatures["fortimon"]             = "Fortinet | FortiClient Monitor Driver | EPP";
+    %edr_driver_signatures["fdedrdrv"]             = "Fortinet | FortiEDR Kernel Driver | EDR";
+
+    # --- Cybereason ---
+    %edr_driver_signatures["psycheddriver"]        = "Cybereason | Kernel Driver | EDR";
+    %edr_driver_signatures["psychedfilterdriver"]  = "Cybereason | Minifilter Driver | EDR";
+
+    # --- Broadcom / Symantec ---
+    %edr_driver_signatures["srtsp"]                = "Broadcom | Symantec Real-Time SP | AV";
+    %edr_driver_signatures["symevent"]             = "Broadcom | Symantec Event Driver | EPP";
+    %edr_driver_signatures["bhdrvx64"]             = "Broadcom | Symantec SONAR Driver | EPP";
+    %edr_driver_signatures["srtspx"]               = "Broadcom | SEP Real-Time SP | AV";
+    %edr_driver_signatures["symefasi"]             = "Broadcom | Symantec FS Monitor | EPP";
+    %edr_driver_signatures["symefa"]               = "Broadcom | Symantec Extended File Attrs | EPP";
+
+    # --- WatchGuard / Panda ---
+    %edr_driver_signatures["pskmad"]               = "WatchGuard | Panda Kernel Monitor | EPP";
+    %edr_driver_signatures["psinfile"]             = "WatchGuard | Panda File Filter | EPP";
+    %edr_driver_signatures["psinproc"]             = "WatchGuard | Panda Process Filter | EPP";
+
+    # --- WithSecure / F-Secure ---
+    %edr_driver_signatures["fsdfw"]                = "WithSecure | F-Secure Firewall Driver | AV";
+    %edr_driver_signatures["fshs"]                 = "WithSecure | F-Secure HS Driver | AV";
+    %edr_driver_signatures["xfsgk"]                = "WithSecure | F-Secure GateKeeper Driver | AV";
+    %edr_driver_signatures["fsatp"]                = "WithSecure | F-Secure ATP Driver | EDR";
+    %edr_driver_signatures["fses"]                 = "WithSecure | F-Secure Endpoint Driver | AV";
+
+    # --- Deep Instinct ---
+    %edr_driver_signatures["deepinstinctdrv"]      = "Deep Instinct | Kernel Driver | EDR";
+
+    # --- Huntress ---
+    %edr_driver_signatures["huntressdrv"]          = "Huntress | Kernel Driver | EDR";
+
+    # --- Avast / AVG ---
+    %edr_driver_signatures["aswsp"]                = "Avast | Self-Protection Driver | AV";
+    %edr_driver_signatures["aswsnx"]               = "Avast | Virtualization Driver | AV";
+    %edr_driver_signatures["aswmonflt"]            = "Avast | Monitor Minifilter | AV";
+    %edr_driver_signatures["aswarpt"]              = "Avast | Anti-Rootkit Driver | AV";
+    %edr_driver_signatures["aswstm"]               = "Avast | Stream Filter | AV";
+
+    # --- Malwarebytes ---
+    %edr_driver_signatures["mbamswissarmy"]        = "Malwarebytes | Swiss Army Kernel Driver | AV";
+    %edr_driver_signatures["farflt"]               = "Malwarebytes | File System Monitor | AV";
+    %edr_driver_signatures["mbam"]                 = "Malwarebytes | Anti-Malware Driver | AV";
+
+    # --- Avira ---
+    %edr_driver_signatures["avgntflt"]             = "Avira | Network Filter Driver | AV";
+    %edr_driver_signatures["avipbb"]               = "Avira | IP Blocker Bridge | AV";
+
+    # --- Webroot ---
+    %edr_driver_signatures["wrkrn"]                = "Webroot | Kernel Driver | AV";
+
+    # --- Check Point ---
+    %edr_driver_signatures["epklib"]               = "Check Point | Endpoint Kernel Library | EPP";
+    %edr_driver_signatures["cpprotect"]            = "Check Point | SandBlast Protection Driver | EDR";
+
+    # --- Comodo / Xcitium ---
+    %edr_driver_signatures["cmdguard"]             = "Comodo | Guard Driver | EPP";
+    %edr_driver_signatures["cmdhlp"]               = "Comodo | Helper Driver | EPP";
+
+    # --- G Data ---
+    %edr_driver_signatures["gdkbflt64"]            = "G Data | Kernel Block Filter | AV";
+    %edr_driver_signatures["gddisk"]               = "G Data | Disk Filter | AV";
+
+    # --- CyberArk ---
+    %edr_driver_signatures["cybkerneltracker"]     = "CyberArk | Kernel Tracker Driver | EPP";
+
+    # --- Tanium ---
+    %edr_driver_signatures["taniumrecorderdrv"]    = "Tanium | Recorder Kernel Driver | Telemetry";
+
+    # --- Nexthink ---
+    %edr_driver_signatures["nxtrdrv"]              = "Nexthink | Endpoint Driver | Telemetry";
+
+    # --- Emsisoft ---
+    %edr_driver_signatures["a2dskm"]               = "Emsisoft | Disk Monitor Driver | AV";
+
+    # --- Dr.Web ---
+    %edr_driver_signatures["dwprot"]               = "Dr.Web | Protection Driver | AV";
+
+    # --- AhnLab ---
+    %edr_driver_signatures["v3monitor"]            = "AhnLab | V3 Endpoint Monitor | AV";
+
+    # --- VIPRE / ThreatTrack ---
+    %edr_driver_signatures["sbredrv"]              = "VIPRE | Kernel Driver | AV";
+
+    # --- Endgame (Elastic legacy) ---
+    %edr_driver_signatures["esensor"]              = "Endgame | Sensor Driver | EDR";
+
+    # --- Dell Secureworks ---
+    %edr_driver_signatures["groundling64"]         = "Secureworks | Red Cloak Driver (x64) | EDR";
+
+    # --- Cisco Secure Endpoint (AMP) ---
+    %edr_driver_signatures["immunetprotect"]       = "Cisco | Secure Endpoint Protection | EDR";
+    %edr_driver_signatures["immunetselfprotect"]   = "Cisco | Secure Endpoint Self-Protection | EDR";
+    %edr_driver_signatures["isedrv"]               = "Cisco | ISE Posture Driver | EPP";
+
+    # --- Norton / Gen Digital ---
+    %edr_driver_signatures["symds"]                = "Norton | Symantec DS Driver | AV";
+    %edr_driver_signatures["symnets"]              = "Norton | Symantec Network Security | AV";
+    %edr_driver_signatures["navex"]                = "Norton | NAV Extraction | AV";
+    %edr_driver_signatures["naveng"]               = "Norton | NAV Engine | AV";
+
+    # --- Avast / AVG additional ---
+    %edr_driver_signatures["aswbidsha"]            = "Avast | Behavior Shield A | AV";
+    %edr_driver_signatures["aswbidsdriver"]        = "Avast | Behavior Shield Driver | AV";
+    %edr_driver_signatures["aswelam"]              = "Avast | ELAM Driver | AV";
+
+    # --- Avira additional ---
+    %edr_driver_signatures["avkmgr"]               = "Avira | AV Kernel Manager | AV";
+
+    # --- Comodo / Xcitium additional ---
+    %edr_driver_signatures["inspect"]              = "Comodo | File Inspection Driver | EPP";
+
+    # --- Emsisoft additional ---
+    %edr_driver_signatures["a2accx64"]             = "Emsisoft | Access Filter (x64) | AV";
+
+    # --- AhnLab additional ---
+    %edr_driver_signatures["v3flt2k"]              = "AhnLab | V3 Filter Driver | AV";
+    %edr_driver_signatures["ahksvr"]               = "AhnLab | Hook Server Driver | AV";
+
+    # --- Zscaler ---
+    %edr_driver_signatures["zscalertun"]           = "Zscaler | Tunnel Driver | ZTNA";
+}
+
+# Initialize all databases
+init_process_sigs();
+init_service_sigs();
+init_driver_sigs();
+
+
+# =========================================================================
+# Helpers
+# =========================================================================
+sub get_vendor {
+    local('@parts');
+    @parts = split(" \\| ", $1);
+    if (size(@parts) >= 1) { return @parts[0]; }
+    return "Unknown";
+}
+
+sub get_product {
+    local('@parts');
+    @parts = split(" \\| ", $1);
+    if (size(@parts) >= 2) { return @parts[1]; }
+    return "Unknown";
+}
+
+sub get_category {
+    local('@parts');
+    @parts = split(" \\| ", $1);
+    if (size(@parts) >= 3) { return @parts[2]; }
+    return "Unknown";
+}
+
+
+# =========================================================================
+# Service name extraction from various output formats
+#
+# Extracts individual service names from three output formats:
+#   1. sc query / BOF:  "SERVICE_NAME: WinDefend"  -> "windefend"
+#   2. PowerShell:      "WinDefend"                 -> "windefend"
+#
+# Returns array of lowercased service names. This is critical for avoiding
+# false positives: blob-level isin matching against the full sc query output
+# would match display names (e.g. "sense" in "System Event Notification
+# Service") and other metadata. By extracting only service short names,
+# signature matching operates on actual service identifiers only.
+# =========================================================================
+sub edr_extract_service_names {
+    local('$output @names @lines $line $name');
+    $output = $1;
+    @names  = @();
+    @lines  = split("\n", $output);
+
+    foreach $line (@lines) {
+        # Trim leading/trailing whitespace (Sleep trim)
+        $line = ["$line" trim];
+
+        # sc query / BOF format: "SERVICE_NAME: WinDefend"
+        if ($line ismatch 'SERVICE_NAME: (.+)') {
+            $name = lc(matched()[0]);
+            $name = ["$name" trim];
+            if (strlen($name) > 0) {
+                push(@names, $name);
+            }
+            continue;
+        }
+
+        # PowerShell format: plain service name, one per line.
+        # Skip empty lines, lines with colons (sc query detail lines like
+        # DISPLAY_NAME:, TYPE:, STATE:), and lines that look like headers/footers.
+        if (strlen($line) == 0) { continue; }
+        if (":" isin $line)     { continue; }
+        if ("---" isin $line)   { continue; }
+        if ("(" isin $line)     { continue; }
+
+        # Remaining non-empty lines without colons = PS service names
+        $name = lc($line);
+        $name = ["$name" trim];
+        if (strlen($name) > 0 && strlen($name) < 256) {
+            push(@names, $name);
+        }
+    }
+    return @names;
+}
+
+
+# =========================================================================
+# Driver name extraction from BOF output
+#
+# Extracts driver names from "DRIVER_NAME: xxx" lines in the BOF output.
+# Returns array of lowercased driver service names.
+# Same logic as SERVICE_NAME extraction but with different prefix.
+#
+# Only the BOF produces DRIVER_NAME lines. The PowerShell and cmd.exe
+# commands enumerate Win32 services only, so this function returns an
+# empty array for their output -- which is correct behavior.
+# =========================================================================
+sub edr_extract_driver_names {
+    local('$output @names @lines $line $name');
+    $output = $1;
+    @names  = @();
+    @lines  = split("\n", $output);
+
+    foreach $line (@lines) {
+        $line = ["$line" trim];
+
+        # BOF format: "DRIVER_NAME: WdFilter"
+        if ($line ismatch 'DRIVER_NAME: (.+)') {
+            $name = lc(matched()[0]);
+            $name = ["$name" trim];
+            if (strlen($name) > 0) {
+                push(@names, $name);
+            }
+        }
+    }
+    return @names;
+}
+
+
+# =========================================================================
+# Tactical guidance: vendor-specific tradecraft notes
+# =========================================================================
+
+
+# =========================================================================
+# Core parser: process list analysis
+# =========================================================================
+sub edr_parse_processes {
+    local('$bid $output $caller $lower_output $key $product_info $vendor $product $category');
+    local('$match_count %found $cat_edr $cat_av $cat_epp $cat_tel');
+
+    $bid    = $1;
+    $output = $2;
+    $caller = $3;   # "check" or "enum"
+    $lower_output = lc($output);
+
+    $match_count = 0;
+    %found = %();
+    $cat_edr = 0; $cat_av = 0; $cat_epp = 0; $cat_tel = 0;
+
+    blog($bid, "");
+    if ($caller eq "enum") {
+        blog($bid, "\c9[EDR-ENUM]\c0 ============ Security Product Enumeration ============");
+        blog($bid, "\c9[EDR-ENUM]\c0 Method:  Process List (bps) + WMI SecurityCenter2");
+        blog($bid, "\c9[EDR-ENUM]\c0 NOISE:   \c4**** High\c0 - bps native + PowerShell WMI query");
+        blog($bid, "\c9[EDR-ENUM]\c0 Sig DB:  " . size(%edr_process_signatures) . " known processes");
+        blog($bid, "\c9[EDR-ENUM]\c0 ======================================================");
+    } else {
+        blog($bid, "\c9[EDR-ENUM]\c0 ============ Security Product Enumeration ============");
+        blog($bid, "\c9[EDR-ENUM]\c0 Method:  Process List Analysis (bps)");
+        blog($bid, "\c9[EDR-ENUM]\c0 NOISE:   \c3* Minimal\c0 - Beacon-native, in-process");
+        blog($bid, "\c9[EDR-ENUM]\c0 Sig DB:  " . size(%edr_process_signatures) . " known processes");
+        blog($bid, "\c9[EDR-ENUM]\c0 ======================================================");
+    }
+
+    foreach $key (keys(%edr_process_signatures)) {
+        if ($key isin $lower_output) {
+            $product_info = %edr_process_signatures[$key];
+            if ($product_info in %found) { continue; }
+            %found[$product_info] = $key;
+            $match_count++;
+            $vendor   = get_vendor($product_info);
+            $product  = get_product($product_info);
+            $category = get_category($product_info);
+
+            if ($category eq "EDR") {
+                blog($bid, "\c4  [EDR]\c0  " . $vendor . " - " . $product . "  (proc: " . $key . ")");
+                $cat_edr++;
+            } else if ($category eq "AV") {
+                blog($bid, "\c8  [AV] \c0  " . $vendor . " - " . $product . "  (proc: " . $key . ")");
+                $cat_av++;
+            } else if ($category eq "EPP") {
+                blog($bid, "\cB  [EPP]\c0  " . $vendor . " - " . $product . "  (proc: " . $key . ")");
+                $cat_epp++;
+            } else if ($category eq "Telemetry" || $category eq "SIEM-EDR" || $category eq "DFIR") {
+                blog($bid, "\c3  [TEL]\c0  " . $vendor . " - " . $product . "  (proc: " . $key . ")");
+                $cat_tel++;
+            } else {
+                blog($bid, "\c9  [OTH]\c0  " . $vendor . " - " . $product . "  (proc: " . $key . ")");
+            }
+        }
+    }
+
+    blog($bid, "");
+    blog($bid, "\c9[EDR-ENUM]\c0 =================== SUMMARY ====================");
+    blog($bid, "\c9[EDR-ENUM]\c0 Unique security products found: " . $match_count);
+    blog($bid, "\c9[EDR-ENUM]\c0   EDR Solutions:   " . $cat_edr);
+    blog($bid, "\c9[EDR-ENUM]\c0   AV Products:     " . $cat_av);
+    blog($bid, "\c9[EDR-ENUM]\c0   EPP Platforms:   " . $cat_epp);
+    blog($bid, "\c9[EDR-ENUM]\c0   Telemetry/SIEM:  " . $cat_tel);
+
+    if ($match_count == 0) {
+        blog($bid, "\c4[EDR-ENUM] WARNING: No known security products detected.\c0");
+        blog($bid, "\c4[EDR-ENUM]   Possible: kernel-only, cloud-native, renamed process\c0");
+    }
+
+    blog($bid, "");
+    if ($cat_edr > 0) {
+        blog($bid, "\c4[EDR-ENUM]  Threat Level: HIGH - Active EDR detected\c0");
+    } else if ($cat_av > 0 && $cat_tel > 0) {
+        blog($bid, "\c8[EDR-ENUM]  Threat Level: MODERATE - AV + Telemetry active\c0");
+    } else if ($cat_av > 0) {
+        blog($bid, "\c8[EDR-ENUM]  Threat Level: LOW-MODERATE - AV only, no EDR\c0");
+    } else if ($match_count > 0) {
+        blog($bid, "\c3[EDR-ENUM]  Threat Level: LOW - Non-EDR security only\c0");
+    } else {
+        blog($bid, "\c4[EDR-ENUM]  Threat Level: UNKNOWN - No products detected\c0");
+    }
+
+    blog($bid, "\c9[EDR-ENUM]\c0 =================================================");
+}
+
+
+# =========================================================================
+# Core parser: service-based analysis (shared by all service commands)
+# $method parameter labels the output header for operator awareness
+#
+# v2.3.0: Now also matches kernel driver names from BOF output.
+# The BOF outputs "DRIVER_NAME: xxx" lines which are extracted by
+# edr_extract_driver_names() and matched against %edr_driver_signatures.
+# Driver matches appear under a [DRV] tag and are counted separately
+# in the summary, but contribute to the category totals (EDR/AV/EPP)
+# for threat level assessment.
+#
+# Non-BOF methods (PowerShell, cmd.exe) don't produce DRIVER_NAME lines,
+# so edr_extract_driver_names() returns an empty array -- zero overhead.
+# =========================================================================
+sub edr_match_services {
+    local('$bid $output $method $key $product_info $vendor $product $category');
+    local('$match_count %found');
+    local('$cat_edr $cat_av $cat_epp $cat_tel $cat_oth $cat_drv');
+    local('@edr_hits @av_hits @epp_hits @tel_hits @oth_hits @drv_hits $entry');
+    local('@svc_names $svc_name @drv_names $drv_name');
+
+    $bid    = $1;
+    $output = $2;
+    $method = $3;
+
+    # Extract service names from output instead of blob-level substring matching.
+    # This prevents false positives from DISPLAY_NAME lines in sc query output.
+    # Example: "sense" would match "System Event Notification Service" display name
+    # on every Windows system, falsely reporting MDE. By extracting only SERVICE_NAME
+    # values (or plain names from PS output), we match against actual service names only.
+    @svc_names = edr_extract_service_names($output);
+
+    # Extract kernel driver names from BOF output (DRIVER_NAME: lines).
+    # Returns empty array for non-BOF methods -- zero overhead.
+    @drv_names = edr_extract_driver_names($output);
+
+    $match_count = 0;
+    %found = %();
+    $cat_edr = 0; $cat_av = 0; $cat_epp = 0; $cat_tel = 0; $cat_oth = 0; $cat_drv = 0;
+    @edr_hits = @(); @av_hits = @(); @epp_hits = @(); @tel_hits = @(); @oth_hits = @(); @drv_hits = @();
+
+    # --- Service matching (user-mode Win32 services) ---
+    # Match each extracted service name against the signature database.
+    # Uses substring (isin) against individual service names to handle per-user
+    # instance suffixes like "webthreatdefusersvc_8b26e" matching "webthreatdefusersvc".
+    foreach $svc_name (@svc_names) {
+        foreach $key (keys(%edr_service_signatures)) {
+            if ($key isin $svc_name) {
+                $product_info = %edr_service_signatures[$key];
+                if ($product_info in %found) { continue; }
+                %found[$product_info] = $key;
+                $match_count++;
+                $vendor   = get_vendor($product_info);
+                $product  = get_product($product_info);
+                $category = get_category($product_info);
+
+                if ($category eq "EDR") {
+                    push(@edr_hits, "\c4    [EDR]\c0  " . $vendor . " - " . $product . "  (svc: " . $key . ")");
+                    $cat_edr++;
+                } else if ($category eq "AV") {
+                    push(@av_hits, "\c8    [AV] \c0  " . $vendor . " - " . $product . "  (svc: " . $key . ")");
+                    $cat_av++;
+                } else if ($category eq "EPP") {
+                    push(@epp_hits, "\cB    [EPP]\c0  " . $vendor . " - " . $product . "  (svc: " . $key . ")");
+                    $cat_epp++;
+                } else if ($category eq "Telemetry" || $category eq "SIEM-EDR" || $category eq "DFIR") {
+                    push(@tel_hits, "\c3    [TEL]\c0  " . $vendor . " - " . $product . "  (svc: " . $key . ")");
+                    $cat_tel++;
+                } else {
+                    push(@oth_hits, "\c9    [OTH]\c0  " . $vendor . " - " . $product . "  (svc: " . $key . ")");
+                    $cat_oth++;
+                }
+            }
+        }
+    }
+
+    # --- Driver matching (kernel drivers from BOF output) ---
+    # Only the BOF produces DRIVER_NAME: lines. Driver matches use [DRV] tag
+    # and contribute to the category totals for threat level assessment.
+    # A kernel driver match alone is sufficient to trigger "HIGH - Active EDR".
+    foreach $drv_name (@drv_names) {
+        foreach $key (keys(%edr_driver_signatures)) {
+            if ($key isin $drv_name) {
+                $product_info = %edr_driver_signatures[$key];
+                if ($product_info in %found) { continue; }
+                %found[$product_info] = $key;
+                $match_count++;
+                $vendor   = get_vendor($product_info);
+                $product  = get_product($product_info);
+                $category = get_category($product_info);
+
+                if ($category eq "EDR") {
+                    push(@drv_hits, "\c4    [DRV]\c0  " . $vendor . " - " . $product . "  (drv: " . $key . ")");
+                    $cat_edr++;
+                    $cat_drv++;
+                } else if ($category eq "AV") {
+                    push(@drv_hits, "\c8    [DRV]\c0  " . $vendor . " - " . $product . "  (drv: " . $key . ")");
+                    $cat_av++;
+                    $cat_drv++;
+                } else if ($category eq "EPP") {
+                    push(@drv_hits, "\cB    [DRV]\c0  " . $vendor . " - " . $product . "  (drv: " . $key . ")");
+                    $cat_epp++;
+                    $cat_drv++;
+                } else if ($category eq "Telemetry" || $category eq "SIEM-EDR" || $category eq "DFIR") {
+                    push(@drv_hits, "\c3    [DRV]\c0  " . $vendor . " - " . $product . "  (drv: " . $key . ")");
+                    $cat_tel++;
+                    $cat_drv++;
+                } else {
+                    push(@drv_hits, "\c9    [DRV]\c0  " . $vendor . " - " . $product . "  (drv: " . $key . ")");
+                    $cat_oth++;
+                    $cat_drv++;
+                }
+            }
+        }
+    }
+
+    blog($bid, "");
+    blog($bid, "\c9[EDR-SVC]\c0  ============ Service-Based Enumeration ============");
+    blog($bid, "\c9[EDR-SVC]\c0  Method:  " . $method);
+    blog($bid, "\c9[EDR-SVC]\c0  Sig DB:  " . size(%edr_service_signatures) . " known services, " . size(%edr_driver_signatures) . " known drivers");
+    blog($bid, "\c9[EDR-SVC]\c0  =================================================");
+
+    if ($match_count == 0) {
+        blog($bid, "");
+        blog($bid, "\c4[EDR-SVC]  WARNING: No known security services detected.\c0");
+        blog($bid, "\c4[EDR-SVC]    Possible: kernel-level driver, cloud-native agent,\c0");
+        blog($bid, "\c4[EDR-SVC]    or non-standard service name.\c0");
+    } else {
+        blog($bid, "");
+        if ($cat_edr > 0) {
+            blog($bid, "\c4  --- EDR Solutions ---\c0");
+            foreach $entry (@edr_hits) { blog($bid, $entry); }
+            blog($bid, "");
+        }
+        if ($cat_av > 0) {
+            blog($bid, "\c8  --- AV Products ---\c0");
+            foreach $entry (@av_hits) { blog($bid, $entry); }
+            blog($bid, "");
+        }
+        if ($cat_epp > 0) {
+            blog($bid, "\cB  --- EPP Platforms ---\c0");
+            foreach $entry (@epp_hits) { blog($bid, $entry); }
+            blog($bid, "");
+        }
+        if ($cat_tel > 0) {
+            blog($bid, "\c3  --- Telemetry / SIEM ---\c0");
+            foreach $entry (@tel_hits) { blog($bid, $entry); }
+            blog($bid, "");
+        }
+        if ($cat_oth > 0) {
+            blog($bid, "\c9  --- Other ---\c0");
+            foreach $entry (@oth_hits) { blog($bid, $entry); }
+            blog($bid, "");
+        }
+        if ($cat_drv > 0) {
+            blog($bid, "\c4  --- Kernel Drivers ---\c0");
+            foreach $entry (@drv_hits) { blog($bid, $entry); }
+            blog($bid, "");
+        }
+    }
+
+    blog($bid, "\c9[EDR-SVC]\c0  =================== SUMMARY ====================");
+    blog($bid, "\c9[EDR-SVC]\c0  Unique security products found: " . $match_count);
+    if ($match_count > 0) {
+        blog($bid, "\c9[EDR-SVC]\c0    EDR Solutions:   " . $cat_edr);
+        blog($bid, "\c9[EDR-SVC]\c0    AV Products:     " . $cat_av);
+        blog($bid, "\c9[EDR-SVC]\c0    EPP Platforms:   " . $cat_epp);
+        blog($bid, "\c9[EDR-SVC]\c0    Telemetry/SIEM:  " . $cat_tel);
+        if ($cat_oth > 0) {
+            blog($bid, "\c9[EDR-SVC]\c0    Other:           " . $cat_oth);
+        }
+        if ($cat_drv > 0) {
+            blog($bid, "\c9[EDR-SVC]\c0    Kernel Drivers:  " . $cat_drv);
+        }
+    }
+
+    blog($bid, "");
+    if ($cat_edr > 0) {
+        blog($bid, "\c4[EDR-SVC]  Threat Level: HIGH - Active EDR detected\c0");
+    } else if ($cat_av > 0 && $cat_tel > 0) {
+        blog($bid, "\c8[EDR-SVC]  Threat Level: MODERATE - AV + Telemetry active\c0");
+    } else if ($cat_av > 0) {
+        blog($bid, "\c8[EDR-SVC]  Threat Level: LOW-MODERATE - AV only, no EDR\c0");
+    } else if ($match_count > 0) {
+        blog($bid, "\c3[EDR-SVC]  Threat Level: LOW - Non-EDR security only\c0");
+    } else {
+        blog($bid, "\c4[EDR-SVC]  Threat Level: UNKNOWN - No products detected\c0");
+    }
+    blog($bid, "\c9[EDR-SVC]\c0  =================================================");
+}
+
+
+# =========================================================================
+# Callbacks
+# =========================================================================
+
+on beacon_output_ps {
+    if ($edr_callback_lock) { return; }
+    local('$bid $text $caller');
+    $bid = $1; $text = $2;
+    # Value-based guard: 1 = edr_check, 2 = edr_enum.
+    # Sleep remove() matches by VALUE not KEY — never use it on hashes.
+    if (%edr_pending_bids[$bid] == 1 || %edr_pending_bids[$bid] == 2) {
+        if (%edr_pending_bids[$bid] == 2) {
+            $caller = "enum";
+        } else {
+            $caller = "check";
+        }
+        %edr_pending_bids[$bid] = 0;
+        $edr_callback_lock = 1;
+        # Try/catch ensures lock is ALWAYS released even if parser throws.
+        # A stuck lock would silently break all future callbacks.
+        try {
+            edr_parse_processes($bid, $text, $caller);
+        } catch $message {
+            berror($bid, "[EDR] Internal error in process parser: " . $message);
+        }
+        $edr_callback_lock = 0;
+    }
+}
+
+on beacon_output {
+    # Global scalar lock — prevents re-entry from blog() inside match functions.
+    if ($edr_callback_lock) { return; }
+    local('$bid $text');
+    $bid = $1; $text = $2;
+
+    # Value-based guard: check ==1 then set to 0 BEFORE processing.
+    # CRITICAL: Sleep remove(%hash, $key) matches by VALUE not KEY — never works.
+    # Using direct value comparison + assignment is the only reliable pattern.
+    # Try/catch ensures lock is ALWAYS released even if a parser throws.
+
+    if (%edr_svc_pending[$bid] == 1) {
+        %edr_svc_pending[$bid] = 0;
+        $edr_callback_lock = 1;
+        try {
+            edr_match_services($bid, $text, "PowerShell Get-Service (bpowershell) [NOISE: ****]");
+        } catch $message {
+            berror($bid, "[EDR] Internal error in service matcher: " . $message);
+        }
+        $edr_callback_lock = 0;
+        return;
+    }
+    if (%edr_cmd_pending[$bid] == 1) {
+        %edr_cmd_pending[$bid] = 0;
+        $edr_callback_lock = 1;
+        try {
+            edr_match_services($bid, $text, "cmd.exe sc query (bshell) [NOISE: ***]");
+        } catch $message {
+            berror($bid, "[EDR] Internal error in service matcher: " . $message);
+        }
+        $edr_callback_lock = 0;
+        return;
+    }
+    if (%edr_pick_pending[$bid] == 1) {
+        %edr_pick_pending[$bid] = 0;
+        $edr_callback_lock = 1;
+        try {
+            edr_match_services($bid, $text, "Unmanaged PowerShell (bpowerpick) [NOISE: **]");
+        } catch $message {
+            berror($bid, "[EDR] Internal error in service matcher: " . $message);
+        }
+        $edr_callback_lock = 0;
+        return;
+    }
+    if (%edr_bof_pending[$bid] == 1) {
+        %edr_bof_pending[$bid] = 0;
+        $edr_callback_lock = 1;
+        try {
+            edr_match_services($bid, $text, "Inline BOF (beacon_inline_execute) [NOISE: *]");
+        } catch $message {
+            berror($bid, "[EDR] Internal error in service matcher: " . $message);
+        }
+        $edr_callback_lock = 0;
+        return;
+    }
+}
+
+
+# =========================================================================
+# Command: edr_check                                    NOISE: * MINIMAL
+# =========================================================================
+alias edr_check {
+    local('$bid');
+    $bid = $1;
+    btask($bid, "\c9[EDR-CHECK]\c0 Quick EDR check (process enumeration only)");
+    btask($bid, "\c9[EDR-CHECK]\c0 NOISE: \c3* Minimal\c0 - Beacon-native bps(), in-process, zero artifacts");
+    %edr_pending_bids[$bid] = 1;
+    bps($bid);
+}
+
+# =========================================================================
+# Command: edr_enum                                     NOISE: **** HIGH
+# =========================================================================
+alias edr_enum {
+    local('$bid');
+    $bid = $1;
+    btask($bid, "\c9[EDR-ENUM]\c0 Full enumeration (process list + WMI SecurityCenter2)");
+    btask($bid, "\c9[EDR-ENUM]\c0 NOISE: \c4**** High\c0 - bps (native) + PowerShell WMI query");
+    btask($bid, "\c9[EDR-ENUM]\c0 Artifacts: powershell.exe child proc, ScriptBlock (4104), AMSI, WMI Log");
+    %edr_pending_bids[$bid] = 2;
+    bps($bid);
+    bpowershell($bid, 'Get-CimInstance -Namespace root/SecurityCenter2 -ClassName AntiVirusProduct 2>$null | Select-Object displayName,pathToSignedProductExe,productState | Format-List');
+}
+
+# =========================================================================
+# Command: edr_services                                 NOISE: **** HIGH
+# PowerShell Get-Service. Spawns powershell.exe.
+# Full PS telemetry: ScriptBlock, Module, AMSI, transcript, process.
+# =========================================================================
+alias edr_services {
+    local('$bid');
+    $bid = $1;
+    btask($bid, "\c9[EDR-SVC]\c0 Service enumeration via PowerShell Get-Service");
+    btask($bid, "\c9[EDR-SVC]\c0 NOISE: \c4**** High\c0 - Spawns powershell.exe, full PS telemetry");
+    btask($bid, "\c9[EDR-SVC]\c0 Artifacts: powershell.exe, ScriptBlock (4104), AMSI, CLR, Sysmon EID 1");
+    btask($bid, "\c9[EDR-SVC]\c0 \c8Prefer:\c0 edr_services_bof (*), edr_services_cmd (***), edr_services_pick (**)");
+    %edr_svc_pending[$bid] = 1;
+    bpowershell($bid, 'Get-Service|?{$_.Status -eq "Running"}|Select -Expand Name');
+}
+
+# =========================================================================
+# Command: edr_services_cmd                             NOISE: *** MODERATE
+#
+# bshell() + sc query. Spawns cmd.exe instead of powershell.exe.
+#
+# Why cmd.exe + sc query is better than bpowershell + Get-Service:
+#   1. cmd.exe is FAR less scrutinized than powershell.exe. Many detection
+#      rules specifically target PS but not cmd.
+#   2. No AMSI -- AMSI only hooks PS, .NET, VBScript, JScript, WMI.
+#      cmd.exe built-in commands bypass AMSI entirely.
+#   3. No ScriptBlock Logging -- this is PS-specific telemetry.
+#   4. No CLR loading -- no .NET runtime loaded into any process.
+#   5. "sc query" is extremely common: run by Windows itself, SCCM,
+#      monitoring agents, login scripts, admin tools. Minimal anomaly
+#      score even in paranoid environments.
+#
+# Why it's still *** and not lower:
+#   - Creates a child process (cmd.exe) logged in Sysmon EID 1 / EID 4688
+#   - Parent-child lineage matters: spawnto -> cmd.exe may trigger rules
+#   - Command line "sc query" is visible (benign, extremely common)
+#
+# sc query output format:
+#   SERVICE_NAME: CrowdStrike
+#   DISPLAY_NAME: CrowdStrike Falcon Sensor
+#           TYPE               : 10  WIN32_OWN_PROCESS
+#           STATE              : 4  RUNNING
+#
+# The blob matcher (isin) handles this verbose output natively -- service
+# names like "csfalconservice" appear in SERVICE_NAME lines and the isin
+# check finds them within the entire output blob.
+# =========================================================================
+alias edr_services_cmd {
+    local('$bid');
+    $bid = $1;
+    btask($bid, "\c9[EDR-SVC]\c0 Service enumeration via cmd.exe + sc query");
+    btask($bid, "\c9[EDR-SVC]\c0 NOISE: \c8*** Moderate\c0 - cmd.exe child process, NO PowerShell/AMSI/CLR");
+    btask($bid, "\c9[EDR-SVC]\c0 Artifacts: cmd.exe process (Sysmon EID 1), command line in EID 4688");
+    btask($bid, "\c9[EDR-SVC]\c0 Avoids: AMSI, ScriptBlock Log, Module Log, CLR load, PS telemetry");
+    %edr_cmd_pending[$bid] = 1;
+    # Plain "sc query" defaults to active WIN32_OWN_PROCESS + WIN32_SHARE_PROCESS.
+    # The type=/state= flags have finicky whitespace requirements that get
+    # mangled when passed through bshell -> cmd.exe /C. Plain sc query works
+    # reliably and returns exactly what we need: running Win32 services.
+    bshell($bid, 'sc query');
+}
+
+# =========================================================================
+# Command: edr_services_pick                            NOISE: ** LOW
+#
+# bpowerpick() - CS's unmanaged PowerShell runner.
+#
+# How it works:
+#   Hosts the CLR in-process (or sacrificial process) without spawning
+#   powershell.exe. Key differences from bpowershell:
+#     - No powershell.exe in process creation logs
+#     - No PowerShell Operational Log entries
+#     - No ScriptBlock Logging (hooks into PS engine internals that
+#       the unmanaged runner doesn't initialize)
+#     - No Module Logging, no Transcription Logging
+#
+# Why still ** and not *:
+#   - CLR loading into a non-.NET process is a known indicator. EDRs
+#     like CrowdStrike, MDE, SentinelOne detect "unmanaged CLR hosting"
+#     (clr.dll loaded into a process not compiled as .NET).
+#   - AMSI is active when CLR initializes. Get-Service is benign content
+#     but the AMSI scan event itself is telemetry.
+#   - .NET Runtime ETW provider emits events on CLR load.
+#
+# Best when:
+#   - Your Beacon process is already a .NET application (CLR already loaded)
+#   - The BOF is not compiled/available
+#   - You want PS cmdlet convenience without PS process artifacts
+# =========================================================================
+alias edr_services_pick {
+    local('$bid');
+    $bid = $1;
+    btask($bid, "\c9[EDR-SVC]\c0 Service enumeration via unmanaged PowerShell (powerpick)");
+    btask($bid, "\c9[EDR-SVC]\c0 NOISE: \c8** Low\c0 - No powershell.exe, no PS logging, but loads CLR + AMSI");
+    btask($bid, "\c9[EDR-SVC]\c0 Artifacts: CLR DLL loads (clr.dll, clrjit.dll), AMSI scan, .NET ETW");
+    btask($bid, "\c9[EDR-SVC]\c0 Avoids: powershell.exe process, ScriptBlock/Module/Transcription logs");
+    %edr_pick_pending[$bid] = 1;
+    bpowerpick($bid, 'Get-Service|?{$_.Status -eq "Running"}|Select -Expand Name');
+}
+
+# =========================================================================
+# Command: edr_services_bof                             NOISE: * MINIMAL
+#
+# Inline BOF execution via beacon_inline_execute().
+#
+# The compiled BOF calls OpenSCManagerW -> EnumServicesStatusExW directly
+# via Win32 API. Runs inside the Beacon process. This is functionally
+# identical noise profile to edr_check (bps): zero child processes, zero DLL
+# loads, zero interaction with AMSI/ETW/PS logging.
+#
+# v2.5.0: Accepts optional mode argument:
+#   edr_services_bof        Both services + drivers (default, backward compat)
+#   edr_services_bof svc    Services only (faster, less output over slow C2)
+#   edr_services_bof drv    Drivers only (check kernel callbacks post-svc-kill)
+#
+# BOF receives mode as packed short: 0=both, 1=svc, 2=drv
+#
+# Compile the BOF (svc_enum_bof.c) and place .o next to this .cna:
+#   x86_64-w64-mingw32-gcc -c svc_enum_bof.c -o svc_enum_bof.x64.o
+#   i686-w64-mingw32-gcc -c svc_enum_bof.c -o svc_enum_bof.x86.o
+# =========================================================================
+alias edr_services_bof {
+    local('$bid $bof_path $handle $data $arch $mode_arg $mode_int $mode_label $bof_args');
+    $bid  = $1;
+    $arch = barch($bid);
+    $bof_path = script_resource("svc_enum_bof." . $arch . ".o");
+
+    if (!-exists $bof_path) {
+        berror($bid, "BOF not found: " . $bof_path);
+        berror($bid, "Compile svc_enum_bof.c and place next to this .cna:");
+        if ($arch eq "x64") {
+            berror($bid, "  x86_64-w64-mingw32-gcc -c svc_enum_bof.c -o svc_enum_bof.x64.o");
+        } else {
+            berror($bid, "  i686-w64-mingw32-gcc -c svc_enum_bof.c -o svc_enum_bof.x86.o");
+        }
+        berror($bid, "Alternative: edr_services_cmd (NOISE: ***) or edr_services_pick (NOISE: **)");
+        return;
+    }
+
+    # Parse optional mode argument
+    # NOTE: trim() does not exist in Sleep. Use explicit null check + lc().
+    if ($2 !is $null && strlen($2) > 0) {
+        $mode_arg = lc($2);
+    } else {
+        $mode_arg = "";
+    }
+
+    if ($mode_arg eq "svc" || $mode_arg eq "services") {
+        $mode_int   = 1;
+        $mode_label = "services only";
+    } else if ($mode_arg eq "drv" || $mode_arg eq "drivers") {
+        $mode_int   = 2;
+        $mode_label = "drivers only";
+    } else if ($mode_arg eq "" || $mode_arg eq "both" || $mode_arg eq "all") {
+        $mode_int   = 0;
+        $mode_label = "services + drivers";
+    } else {
+        berror($bid, "Unknown mode: '" . $2 . "'");
+        berror($bid, "Usage: edr_services_bof [svc|drv|both]");
+        berror($bid, "  (no arg)  Both services and drivers (default)");
+        berror($bid, "  svc       Win32 services only");
+        berror($bid, "  drv       Kernel drivers only");
+        return;
+    }
+
+    btask($bid, "\c9[EDR-BOF]\c0 BOF enumeration: " . $mode_label);
+    btask($bid, "\c9[EDR-BOF]\c0 NOISE: \c3* Minimal\c0 - In-process, no child process, no AMSI/CLR/PS");
+    btask($bid, "\c9[EDR-BOF]\c0 Artifacts: None beyond normal Beacon activity");
+
+    $handle = openf($bof_path);
+    $data   = readb($handle, -1);
+    closef($handle);
+
+    # Pack mode as short for BOF argument
+    $bof_args = bof_pack($bid, "s", $mode_int);
+
+    %edr_bof_pending[$bid] = 1;
+    beacon_inline_execute($bid, $data, "go", $bof_args);
+}
+
+
+# =========================================================================
+# Command: edr_help
+# NOISE: None - client-side only
+# =========================================================================
+alias edr_help {
+    local('$bid');
+    $bid = $1;
+
+    blog($bid, "");
+    blog($bid, "\c9 ================================================================\c0");
+    blog($bid, "\c9   edr_enum.cna v2.5 - Operator Quick Reference\c0");
+    blog($bid, "\c9 ================================================================\c0");
+    blog($bid, "");
+    blog($bid, "\c9 NOISE RATING BASELINE\c0");
+    blog($bid, "\c9 ----------------------------------------------------------------\c0");
+    blog($bid, "  NOISE = detection footprint. More stars = louder = easier to detect.");
+    blog($bid, "    \c3*    = quiet  (good)\c0       \c4**** = loud  (bad)\c0");
+    blog($bid, "  The commands are legitimate; the risk is HOW they execute.");
+    blog($bid, "");
+    blog($bid, "  NOTE: Levels are NOT cumulative. ** (CLR load) and *** (cmd.exe)");
+    blog($bid, "  open different detection surfaces, not additive ones.");
+    blog($bid, "");
+    blog($bid, "  \c3*     MINIMAL\c0   Zero new detection surfaces.");
+    blog($bid, "                   Runs inside Beacon. No child proc, no DLL loads,");
+    blog($bid, "                   no ETW, no AMSI, no logging triggered.");
+    blog($bid, "                   Surfaces: (none)");
+    blog($bid, "");
+    blog($bid, "  \c8**    LOW\c0       +CLR runtime loaded into Beacon process.");
+    blog($bid, "                   No child proc, but clr.dll loads. AMSI scans content.");
+    blog($bid, "                   Risk: 'unmanaged CLR hosting' is a known EDR indicator.");
+    blog($bid, "                   Surfaces: CLR DLLs, AMSI, .NET ETW");
+    blog($bid, "");
+    blog($bid, "  \c8***   MODERATE\c0  +Child process in process tree.");
+    blog($bid, "                   Spawns cmd.exe. No CLR, no AMSI, no PS logging.");
+    blog($bid, "                   Risk: parent-child lineage (spawnto -> cmd.exe).");
+    blog($bid, "                   Surfaces: Sysmon EID 1, EID 4688, command line");
+    blog($bid, "");
+    blog($bid, "  \c4****  HIGH\c0      +PowerShell = maximum telemetry.");
+    blog($bid, "                   Spawns powershell.exe. Every logging framework fires.");
+    blog($bid, "                   'Any proc spawning PS' = default rule in most EDRs.");
+    blog($bid, "                   Surfaces: ScriptBlock, Module, AMSI, CLR, Sysmon, ETW");
+    blog($bid, "");
+    blog($bid, "  \c4***** CRITICAL\c0  Disk writes, system mods, known-bad signatures.");
+    blog($bid, "                   No edr_enum command reaches this level.");
+    blog($bid, "");
+
+    blog($bid, "\c9 COMMANDS (sorted by noise level, lowest first)\c0");
+    blog($bid, "\c9 ----------------------------------------------------------------\c0");
+    blog($bid, "");
+    blog($bid, "  \c3edr_check\c0            *     Process-only via bps()");
+    blog($bid, "    Spawns: nothing    Logs: none    AMSI: no    CLR: no");
+    blog($bid, "    Misses: headless services, kernel-only, stopped products");
+    blog($bid, "");
+    blog($bid, "  \c3edr_services_bof\c0     *     Service + driver enum via compiled BOF");
+    blog($bid, "    Spawns: nothing    Logs: none    AMSI: no    CLR: no");
+    blog($bid, "    Requires: svc_enum_bof.{x64|x86}.o next to this .cna");
+    blog($bid, "");
+    blog($bid, "    \c3Modes:\c0");
+    blog($bid, "      edr_services_bof         Both services + drivers (default)");
+    blog($bid, "      edr_services_bof svc     Win32 services only");
+    blog($bid, "      edr_services_bof drv     Kernel drivers only");
+    blog($bid, "");
+    blog($bid, "    \c3Use cases:\c0");
+    blog($bid, "      svc   Quick vendor ID, less output over slow C2");
+    blog($bid, "      drv   Post-exploitation: verify kernel callbacks after svc kill");
+    blog($bid, "      both  Full picture at zero additional cost");
+    blog($bid, "");
+    blog($bid, "  \c8edr_services_pick\c0    **    Service enum via bpowerpick");
+    blog($bid, "    Spawns: nothing    Logs: .NET ETW    AMSI: yes    CLR: yes");
+    blog($bid, "    Avoids: PS process, ScriptBlock/Module/Transcription logs");
+    blog($bid, "");
+    blog($bid, "  \c8edr_services_cmd\c0     ***   Service enum via bshell + sc query");
+    blog($bid, "    Spawns: cmd.exe    Logs: EID 1/4688    AMSI: no    CLR: no");
+    blog($bid, "    Avoids: all PS-specific telemetry, CLR loading");
+    blog($bid, "");
+    blog($bid, "  \c4edr_services\c0         ****  Service enum via bpowershell");
+    blog($bid, "    Spawns: powershell.exe    Logs: EID 1/4104/4103    AMSI: yes    CLR: yes");
+    blog($bid, "    Generates maximum artifacts. Only if PS is expected.");
+    blog($bid, "");
+    blog($bid, "  \c4edr_enum\c0             ****  Full enum (bps + PowerShell WMI)");
+    blog($bid, "    Same as edr_services + WMI SecurityCenter2 query.");
+    blog($bid, "    WMI Activity Log. SecurityCenter2 = workstation only.");
+    blog($bid, "");
+
+    blog($bid, "\c9 RECOMMENDED WORKFLOW\c0");
+    blog($bid, "\c9 ----------------------------------------------------------------\c0");
+    blog($bid, "  1. \c3edr_check\c0                Always. Zero cost.");
+    blog($bid, "  2. \c3edr_services_bof\c0         If BOF compiled. Zero cost.");
+    blog($bid, "     \c3edr_services_bof svc\c0     Quick vendor ID only.");
+    blog($bid, "     \c3edr_services_bof drv\c0     Drivers only (post-svc-kill check).");
+    blog($bid, "  3. \c8edr_services_pick\c0        If CLR load acceptable.");
+    blog($bid, "  4. \c8edr_services_cmd\c0         If cmd.exe child acceptable.");
+    blog($bid, "  5. \c4edr_services\c0             Only if PS already expected.");
+    blog($bid, "  6. \c4edr_enum\c0                 Full picture, highest cost.");
+    blog($bid, "");
+    blog($bid, "  \c3Best combo:\c0 edr_check + edr_services_bof = full process, service,");
+    blog($bid, "  AND kernel driver visibility at noise level * with zero extra artifacts.");
+    blog($bid, "");
+    blog($bid, "  \c3Post-exploit:\c0 After killing an EDR service, run edr_services_bof drv");
+    blog($bid, "  to verify whether kernel callbacks/minifilters are still loaded.");
+    blog($bid, "");
+
+    blog($bid, "\c9 ARTIFACT MATRIX (detection surface)\c0");
+    blog($bid, "\c9 ----------------------------------------------------------------\c0");
+    blog($bid, "                    check  bof   bof   bof   pick  cmd   svc   enum");
+    blog($bid, "                           both  svc   drv");
+    blog($bid, "  Child Process:    -      -     -     -     -     cmd   PS    PS");
+    blog($bid, "  CLR Loading:      -      -     -     -     YES   -     YES   YES");
+    blog($bid, "  AMSI:             -      -     -     -     YES   -     YES   YES");
+    blog($bid, "  ScriptBlock:      -      -     -     -     -     -     YES   YES");
+    blog($bid, "  Module Log:       -      -     -     -     -     -     YES   YES");
+    blog($bid, "  Transcript:       -      -     -     -     -     -     poss  poss");
+    blog($bid, "  WMI Log:          -      -     -     -     -     -     -     YES");
+    blog($bid, "  Sysmon EID 1:     -      -     -     -     -     YES   YES   YES");
+    blog($bid, "  Sysmon EID 7:     -      -     -     -     YES   -     -     -");
+    blog($bid, "  .NET ETW:         -      -     -     -     YES   -     -     -");
+    blog($bid, "  EID 4688:         -      -     -     -     -     YES   YES   YES");
+    blog($bid, "  Legend: - = none, YES = generated, cmd/PS = child process type");
+    blog($bid, "");
+    blog($bid, "\c9 COVERAGE MATRIX (what you get back)\c0");
+    blog($bid, "\c9 ----------------------------------------------------------------\c0");
+    blog($bid, "                    check  bof   bof   bof   pick  cmd   svc   enum");
+    blog($bid, "                           both  svc   drv");
+    blog($bid, "  Processes:        YES    -     -     -     -     -     -     YES");
+    blog($bid, "  Services:         -      YES   YES   -     YES   YES   YES   YES");
+    blog($bid, "  Kernel Drivers:   -      YES   -     YES   -     -     -     -");
+    blog($bid, "  WMI AV Products:  -      -     -     -     -     -     -     YES");
+    blog($bid, "  Legend: YES = enumerated, - = not covered");
+    blog($bid, "");
+
+    blog($bid, "\c9 COLOR CODING\c0");
+    blog($bid, "\c9 ----------------------------------------------------------------\c0");
+    blog($bid, "  \c4[EDR]\c0  Red     EDR (kernel hooks, behavioral, cloud analytics)");
+    blog($bid, "  \c8[AV] \c0  Orange  Antivirus (signatures, heuristics, AMSI)");
+    blog($bid, "  \cB[EPP]\c0  Blue    Endpoint Protection Platform");
+    blog($bid, "  \c3[TEL]\c0  Green   Telemetry / SIEM (logging, forwarding)");
+    blog($bid, "  \c9[OTH]\c0  Cyan    Other (vuln scanner, DFIR, ZTNA)");
+    blog($bid, "  \c4[DRV]\c0  Red     Kernel driver (minifilter, callback, ELAM)");
+    blog($bid, "");
+
+    blog($bid, "\c9 THREAT LEVELS\c0");
+    blog($bid, "\c9 ----------------------------------------------------------------\c0");
+    blog($bid, "  \c4HIGH\c0       EDR active. Kernel callbacks, user-mode hooks, ETW TI,");
+    blog($bid, "             cloud analytics, tamper protection.");
+    blog($bid, "  \c8MODERATE\c0   AV + Telemetry. Scanning + event forwarding to SOC.");
+    blog($bid, "  \c8LOW-MOD\c0    AV only. File scanning, heuristics, AMSI.");
+    blog($bid, "  \c3LOW\c0        Non-EDR/AV (EPP, vuln scanner). Minimal real-time.");
+    blog($bid, "  \c4UNKNOWN\c0    Nothing found. May be kernel-only, agentless, or NDR.");
+    blog($bid, "");
+
+    blog($bid, "\c9 MALLEABLE C2 NOTE\c0");
+    blog($bid, "\c9 ----------------------------------------------------------------\c0");
+    blog($bid, "  Child-process commands use .post-ex.spawnto settings.");
+    blog($bid, "  Parent-child lineage is often MORE detectable than the command.");
+    blog($bid, "  Ensure spawnto plausibly spawns cmd/PS in the target environment.");
+    blog($bid, "");
+
+    blog($bid, "\c9 SIGNATURE DATABASE\c0");
+    blog($bid, "\c9 ----------------------------------------------------------------\c0");
+    blog($bid, "  Process signatures: " . size(%edr_process_signatures));
+    blog($bid, "  Service signatures: " . size(%edr_service_signatures));
+    blog($bid, "  Driver signatures:  " . size(%edr_driver_signatures));
+    blog($bid, "  Vendors: 48   Categories: EDR, AV, EPP, Telemetry, SIEM, DFIR, ZTNA");
+    blog($bid, "");
+    blog($bid, "\c9 ================================================================\c0");
+}
+
+
+# =========================================================================
+# Help registration
+# =========================================================================
+
+beacon_command_register("edr_check",
+    "Quick EDR check via process list [NOISE: * Minimal]",
+    "Synopsis: edr_check\n\nNOISE: * MINIMAL - Beacon-native bps(). Zero artifacts.\nUse: Always run first.\nSee Also: edr_services_bof, edr_services_cmd, edr_help");
+
+beacon_command_register("edr_enum",
+    "Full AV/EPP/EDR enum: processes + WMI [NOISE: **** High]",
+    "Synopsis: edr_enum\n\nNOISE: **** HIGH - bps() + PowerShell WMI query.\nArtifacts: powershell.exe, ScriptBlock (4104), AMSI, WMI Log.\nNote: SecurityCenter2 is workstation-only.\nSee Also: edr_check, edr_services_bof, edr_help");
+
+beacon_command_register("edr_services",
+    "Service enum via PowerShell Get-Service [NOISE: **** High]",
+    "Synopsis: edr_services\n\nNOISE: **** HIGH - Spawns powershell.exe. Full PS telemetry.\nPrefer: edr_services_bof (*), edr_services_cmd (***), edr_services_pick (**)\nSee Also: edr_help");
+
+beacon_command_register("edr_services_cmd",
+    "Service enum via cmd.exe + sc query [NOISE: *** Moderate]",
+    "Synopsis: edr_services_cmd\n\nNOISE: *** MODERATE - cmd.exe child process.\nNo AMSI, no CLR, no PS logging. 'sc query' has minimal anomaly score.\nRisk: parent-child lineage (spawnto -> cmd.exe).\nSee Also: edr_services_bof, edr_services_pick, edr_help");
+
+beacon_command_register("edr_services_pick",
+    "Service enum via unmanaged PowerShell [NOISE: ** Low]",
+    "Synopsis: edr_services_pick\n\nNOISE: ** LOW - bpowerpick(). No powershell.exe process.\nLoads CLR + AMSI. No ScriptBlock/Module/Transcription logging.\nRisk: 'unmanaged CLR hosting' detection.\nSee Also: edr_services_bof, edr_services_cmd, edr_help");
+
+beacon_command_register("edr_services_bof",
+    "Service + driver enum via inline BOF [NOISE: * Minimal]",
+    "Synopsis: edr_services_bof [svc|drv|both]\n\nNOISE: * MINIMAL - In-process BOF. Zero artifacts.\n\nModes:\n  (no arg)  Both services + drivers (default, backward compatible)\n  svc       Win32 services only (quick vendor ID, less output)\n  drv       Kernel drivers only (check callbacks after svc kill)\n  both      Explicit alias for default behavior\n\nEnumerates: Win32 services (SERVICE_WIN32) + kernel drivers (SERVICE_DRIVER)\nRequires: svc_enum_bof.{x64|x86}.o next to this .cna\nCompile: x86_64-w64-mingw32-gcc -c svc_enum_bof.c -o svc_enum_bof.x64.o\nSee Also: edr_check, edr_services_cmd, edr_help");
+
+beacon_command_register("edr_help",
+    "Detailed EDR enumeration help and noise reference",
+    "Synopsis: edr_help\n\nNOISE: None - client-side only.\nDisplays: commands, noise baseline, artifact matrix, workflow, threat levels.");
+
+
+# =========================================================================
+# Load notification
+# =========================================================================
+println("[+] edr_enum.cna v2.5 loaded");
+println("[+] Process sigs: " . size(%edr_process_signatures) . " | Service sigs: " . size(%edr_service_signatures) . " | Driver sigs: " . size(%edr_driver_signatures));
+println("[+] Commands (sorted by noise level):");
+println("[+]   edr_check                *     Process-only (bps)");
+println("[+]   edr_services_bof [mode]  *     BOF enum (needs .o file)");
+println("[+]     modes: svc | drv | both (default)");
+println("[+]   edr_services_pick        **    Unmanaged PowerShell service enum");
+println("[+]   edr_services_cmd         ***   cmd.exe + sc query service enum");
+println("[+]   edr_services             ****  PowerShell Get-Service");
+println("[+]   edr_enum                 ****  Full enum (bps + PS WMI)");
+println("[+]   edr_help                       Operator reference");
