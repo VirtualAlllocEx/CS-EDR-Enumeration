@@ -46,6 +46,7 @@ Commands sorted by noise level (lowest → highest):
 | `edr_services_cmd` | ★★★ | `bshell` + `sc query` | cmd.exe | — | — | — |
 | `edr_services` | ★★★★ | `bpowershell` + `Get-Service` | powershell.exe | Yes | Yes | Yes |
 | `edr_enum` | ★★★★ | `bps()` + PowerShell WMI | powershell.exe | Yes | Yes | Yes |
+| `edr_help` | — | Client-side only (no Beacon traffic) | — | — | — | — |
 
 > **—** = not generated &nbsp;│&nbsp; **Yes** = generated &nbsp;│&nbsp; Noise: ★ minimal → ★★★★ loud
 
@@ -70,7 +71,7 @@ One compiled BOF, one `inline-execute` call. The operator picks scope at runtime
    edr_services_bof drv     ★     Drivers only (post-svc-kill check).
 3. edr_services_pick        ★★    If CLR loading is acceptable.
 4. edr_services_cmd         ★★★   If cmd.exe child is acceptable.
-5. edr_services             ★★★★  Only if PowerShell is already expected.
+5. edr_services              ★★★★  Only if PowerShell is already expected.
 6. edr_enum                 ★★★★  Full picture, highest artifact cost.
 ```
 
@@ -114,6 +115,10 @@ WMI AV Products:    -      -     -     -     -     -     -     YES
 ```
 
 > **YES** = enumerated &nbsp;│&nbsp; **-** = not covered. More **YES** = better intel.
+
+### Operator Reference (`edr_help`)
+
+Run `edr_help` in any Beacon to display a built-in quick reference card. Client-side only — no traffic to the target. Covers noise baseline definitions, all commands with their artifacts, recommended workflow, artifact and coverage matrices, color coding legend, threat levels, Malleable C2 notes, and current signature database stats.
 
 ## Installation
 
@@ -181,7 +186,7 @@ Uses Beacon's native `bps()` — no child process, no DLL loads, no ETW. Zero ar
 In-process enumeration via `OpenSCManagerW` + `EnumServicesStatusExW`. Enumerates both Win32 services and kernel drivers. Same noise level as `edr_check`.
 
 <p align="center">
-  <img width="700" alt="edr_services_bof service and driver enumeration output" src="https://github.com/user-attachments/assets/8ad524ea-772c-4fc2-a764-9b17a9175e8e" />
+  <img width="700" alt="edr_services_bof service and driver enumeration output" src="https://github.com/user-attachments/assets/4b91bf47-04dc-44cd-8ac9-cc695c37500d" />
 </p>
 
 ### Other Methods
