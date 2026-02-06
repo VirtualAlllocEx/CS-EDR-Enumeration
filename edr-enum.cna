@@ -2,7 +2,7 @@
 # edr_enum.cna - AV/EPP/EDR Enumeration via Beacon
 # Cobalt Strike 4.12 Aggressor Script
 #
-# Author:       Daniel
+# Author:       VirtualAllocEx
 # Version:      2.5.0
 # Last Updated: 2026-02-06
 #
@@ -1759,3 +1759,4 @@ println("[+]   edr_services_cmd         ***   cmd.exe + sc query service enum");
 println("[+]   edr_services             ****  PowerShell Get-Service");
 println("[+]   edr_enum                 ****  Full enum (bps + PS WMI)");
 println("[+]   edr_help                       Operator reference");
+
