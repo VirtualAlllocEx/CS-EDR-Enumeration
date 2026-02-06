@@ -120,6 +120,10 @@ WMI AV Products:    -      -     -     -     -     -     -     YES
 
 Run `edr_help` in any Beacon to display a built-in quick reference card. Client-side only — no traffic to the target. Covers noise baseline definitions, all commands with their artifacts, recommended workflow, artifact and coverage matrices, color coding legend, threat levels, Malleable C2 notes, and current signature database stats.
 
+<p align="center">
+  <img width="700" alt="edr_help operator quick reference output" src="https://github.com/user-attachments/assets/05eb0988-7ce3-428b-a52e-6209bd1078ff" />
+</p>
+
 ## Installation
 
 ### 1. Load the Aggressor Script
