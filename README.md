@@ -175,7 +175,7 @@ Uses Beacon's native `bps()` — no child process, no DLL loads, no ETW. Zero ar
 In-process enumeration via `OpenSCManagerW` + `EnumServicesStatusExW`. Enumerates both Win32 services and kernel drivers. Same noise level as `edr_check`.
 
 <p align="center">
-  <img width="700" alt="edr_services_bof service and driver enumeration output" src="https://github.com/user-attachments/assets/4b91bf47-04dc-44cd-8ac9-cc695c37500d" />
+  <img width="700" alt="edr_services_bof service and driver enumeration output" src="https://github.com/user-attachments/assets/2da8c8cf-fa08-4f1b-99bf-a3b6f3199575" />
 </p>
 
 ### Other Methods
