@@ -16,7 +16,7 @@ This script provides a graduated approach — from completely silent (in-process
 ## Features
 
 - Broad signature database covering **processes**, **services**, and **kernel drivers** across all major EDR, AV, EPP, and telemetry vendors
-- **Kernel driver enumeration** — detects EDR minifilters 
+- **Kernel driver enumeration** — detects EDR minifilters and callback drivers that persist even after user-mode services are killed or tampered with 
 - **Six commands** sorted by noise level from `★` (silent) to `★★★★` (loud)
 - **BOF with mode selection** — enumerate services only, drivers only, or both
 - Inline BOF execution — zero child processes, no AMSI/CLR/ETW
