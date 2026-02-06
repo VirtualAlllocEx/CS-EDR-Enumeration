@@ -1,7 +1,4 @@
 # CS-EDR-Enumeration
-Multi-method EDR/AV/EPP enumeration for Cobalt Strike with calibrated noise ratings. Six detection methods from silent BOF execution to full PowerShell telemetry.
-
-# CS-EDR-Enumeration
 
 Cobalt Strike Aggressor Script for enumerating AV, EPP, EDR, and Telemetry/SIEM products on compromised Windows hosts. Provides **six enumeration commands** with different noise footprints, letting operators choose the method that fits their current risk tolerance.
 
@@ -114,20 +111,20 @@ CS-EDR-Enumeration/
 
 Uses Beacon's native `bps()` — no child process, no DLL loads, no ETW. Zero artifacts.
 
-![edr_check output](screenshots/process_analysis.png)
+<img width="1664" height="812" alt="image" src="https://github.com/user-attachments/assets/aa2f00ae-74aa-4db0-ae3a-f4762ab36e13" />
 
 ### BOF Service Enumeration (`edr_services_bof`)
 
 In-process service enumeration via `OpenSCManagerW` + `EnumServicesStatusExW`. Same noise level as `edr_check`.
 
-![edr_services_bof output](screenshots/bof_enum.png)
+<img width="1572" height="943" alt="image" src="https://github.com/user-attachments/assets/4b91bf47-04dc-44cd-8ac9-cc695c37500d" />
 
 ### Other Methods
 
 <details>
 <summary>bpowerpick — Unmanaged PowerShell (★★)</summary>
 
-![bpowerpick output](screenshots/bpowerpick_enum.png)
+<img width="1611" height="939" alt="image" src="https://github.com/user-attachments/assets/7ebd8eec-c7b3-4da8-b9ca-8694e272d2f5" />
 
 Loads CLR into Beacon process. No `powershell.exe` child, but EDRs may flag unmanaged CLR hosting.
 </details>
@@ -135,7 +132,7 @@ Loads CLR into Beacon process. No `powershell.exe` child, but EDRs may flag unma
 <details>
 <summary>bpowershell — PowerShell Get-Service (★★★★)</summary>
 
-![bpowershell output](screenshots/bpowershell_enum.png)
+<img width="1621" height="926" alt="image" src="https://github.com/user-attachments/assets/d8075abc-67b3-4e2c-b28e-f28d0bbc699f" />
 
 Spawns `powershell.exe` — activates ScriptBlock logging, Module logging, AMSI, and process creation events.
 </details>
@@ -143,7 +140,7 @@ Spawns `powershell.exe` — activates ScriptBlock logging, Module logging, AMSI,
 <details>
 <summary>bshell — cmd.exe sc query (★★★)</summary>
 
-![bshell output](screenshots/bshell_enum.png)
+<img width="1551" height="981" alt="image" src="https://github.com/user-attachments/assets/5ded11af-71c8-4606-bb89-b3c0437ce0f8" />
 
 Spawns `cmd.exe`. Logged in Sysmon EID 1 / Windows EID 4688 with command line. No CLR, no AMSI, no PS telemetry.
 </details>
