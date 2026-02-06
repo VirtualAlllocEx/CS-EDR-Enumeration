@@ -240,7 +240,7 @@ The script uses **NOISE** rather than "OPSEC" ratings deliberately. "OPSEC: ★�
 
 ## Malleable C2 Dependency
 
-Commands that spawn child processes (`bshell`, `bpowershell`, `bpowerpick`) use your Malleable C2 profile's `.post-ex.spawnto` settings. The parent-child lineage is often **more detectable** than the command content itself. Make sure your `spawnto` binary plausibly spawns `cmd.exe` or `powershell.exe` in the target environment.
+Commands that spawn child processes (`bshell`, `bpowershell`, `bpowerpick`) inherit your Malleable C2 profile's `.post-ex.spawnto` settings. The parent-child lineage (e.g. `rundll32.exe` → `powershell.exe`) is an additional detection surface on top of the command itself — and one that most EDRs flag by default. This is why `edr_check` + `edr_services_bof` is the recommended approach: no child process, no lineage to analyze.
 
 ## BOF Technical Details
 
