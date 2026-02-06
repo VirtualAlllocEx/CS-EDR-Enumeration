@@ -111,7 +111,7 @@ CS-EDR-Enumeration/
 
 Uses Beacon's native `bps()` — no child process, no DLL loads, no ETW. Zero artifacts.
 
-<img width="1664" height="812" alt="image" src="https://github.com/user-attachments/assets/aa2f00ae-74aa-4db0-ae3a-f4762ab36e13" />
+<img width="800" height="812" alt="image" src="https://github.com/user-attachments/assets/aa2f00ae-74aa-4db0-ae3a-f4762ab36e13" />
 
 ### BOF Service Enumeration (`edr_services_bof`)
 
