@@ -22,7 +22,6 @@ This script provides a graduated approach — from completely silent (in-process
 - Inline BOF execution — zero child processes, no AMSI/CLR/ETW
 - Automatic threat level assessment (HIGH / MODERATE / LOW)
 - Color-coded output by product category: `[EDR]` `[AV]` `[EPP]` `[TEL]` `[DRV]`
-- Vendor-specific tactical guidance when threats are detected
 - Built-in `edr_help` with split artifact/coverage matrices
 
 ## Supported Vendors
