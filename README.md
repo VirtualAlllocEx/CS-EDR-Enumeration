@@ -15,7 +15,7 @@ This script provides a graduated approach — from completely silent (in-process
 
 ## Features
 
-- **199 process**, **115 service**, and **133 driver signatures** covering **48 security vendors**
+- Broad signature database covering **processes**, **services**, and **kernel drivers** across all major EDR, AV, EPP, and telemetry vendors
 - **Kernel driver enumeration** — detects EDR minifilters and callbacks even when user-mode services are stopped
 - **Six commands** sorted by noise level from `★` (silent) to `★★★★` (loud)
 - **BOF with mode selection** — enumerate services only, drivers only, or both
